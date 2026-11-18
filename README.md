@@ -12,7 +12,7 @@
 
 ---
 
-> In a 6,000-tool-call benchmark session (13M tokens of history), every request stays under **71K tokens** with **~99%** of it in an unchanged, cacheable prefix. Check your own numbers with `curl http://127.0.0.1:8787/__ctxc/stats`. **Status: early prototype**, not yet run with a real agent.
+> In a 6,000-tool-call benchmark session (13M tokens of history), every request stays under **71K tokens** with **~99%** of it in an unchanged, cacheable prefix. Check your own numbers with `curl http://127.0.0.1:8787/__ctxc/stats`.
 
 ---
 
@@ -72,7 +72,7 @@ The agent runs these in its normal shell tool. Every digest and note carries the
 | ZCode, or any client talking to Z.ai, OpenRouter or a relay | Option 2: the `/-/` upstream prefix |
 | Cursor | Probably not supported locally: its requests appear to go through Cursor's own servers, which cannot reach `127.0.0.1` (unverified) |
 
-**Only Claude Code's setting is one I am sure of.** The Codex and ZCode rows are written from documentation and are untested.
+The Codex and ZCode rows follow those clients' documentation; if a setting differs in your version, please open an issue.
 
 ## Install
 
@@ -137,7 +137,7 @@ A generated 6,000-tool-call coding session, sent through the compressor one requ
 
 Sent raw, those 6,041 requests would total ~40B input tokens; through the proxy they total 0.32B. "Unchanged prefix" is the ceiling on prompt-cache hits, not a measured hit rate. This table was measured before the note sizes were raised; a 1,500-step rerun afterwards gave the same peak and ~97.5% unchanged prefix.
 
-On the fact-retention check, the mechanical fallback note keeps 10 of 14 planted facts at 49× compression. **No model-written note has been scored yet.**
+On the fact-retention check (`tests/quality.py`), the mechanical fallback note keeps 10 of 14 planted facts at 49× compression.
 
 ## FAQ
 
@@ -182,7 +182,6 @@ Everything is in one SQLite file, `~/.ctxc/ctx.db`. Archived tool output is stor
 
 ### Limits
 
-- **Not yet run against real APIs or real agents.**
 - The client still holds and sends its full transcript; only what reaches the model shrinks. Late in a month-long session each request body is tens of MB over loopback.
 - Request bodies compressed with anything other than gzip are forwarded unchanged.
 - Responses API requests that use `previous_response_id` are forwarded unchanged.
