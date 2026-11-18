@@ -30,7 +30,9 @@ Default upstreams are `api.anthropic.com` and `api.openai.com`; change them with
 `--anthropic-upstream` / `--openai-upstream`. Your API key or login token passes
 through in the request headers and is never stored.
 
-## How it compresses
+## How it works
+
+![How Smart Context Compressor works](docs/how-it-works.svg)
 
 Each request is rebuilt as four zones:
 
