@@ -1,14 +1,41 @@
 # Smart Context Compressor
 
-Smart Context Compressor (command: `ctxc`) is a small proxy that sits between a coding agent and its model API and keeps every
-request inside a fixed token window (default 100K), however long the session runs.
+## What it does
+
+AI coding agents (Claude Code, Codex, ZCode and others) send the whole
+conversation to the model on every turn. In a long session that conversation
+keeps growing until it no longer fits in the model's context window. The agent
+then either stops, or throws away most of its history in one lossy step and
+forgets what it was doing.
+
+Smart Context Compressor (command: `ctxc`) is a small program that runs on your
+machine between the agent and the model. Each time the agent sends its
+conversation, it shrinks it to fit a fixed budget (100K tokens by default)
+before passing it on:
+
+- **Recent work is left exactly as it is**, so the model sees what it is doing now.
+- **Old tool output is trimmed**: long logs, test runs and file dumps are cut to
+  their beginning, their error lines and their end.
+- **The oldest part of the conversation is replaced by notes**: what you asked
+  for, what was decided and why, what changed in each file, exact values worth
+  keeping, and what is still unfinished.
+- **Nothing is deleted**: everything removed is saved to a local database, and
+  the agent can look up the original whenever it needs the exact detail.
+
+The result is that a session can run for weeks without hitting the limit, and
+each request costs far less than sending the full history would.
+
+## Why this one
 
 - One Python file, standard library only. No Node, no build, no certificates.
 - Works at the HTTP level, so it is agent-agnostic: Anthropic Messages,
   OpenAI Chat Completions and OpenAI Responses.
 - The model never spends a turn on compression. Responses stream back untouched.
-- Nothing is thrown away: every removed byte is archived in SQLite and the agent
-  can fetch it back from its shell.
+- Prompt caching keeps working, because the compressed conversation only changes
+  when it has to.
+
+> **Status:** early prototype. It passes its own tests against a simulated model
+> API but has not yet been run with a real agent. See [Limits](#limits--read-before-relying-on-it).
 
 ## Quick start
 
