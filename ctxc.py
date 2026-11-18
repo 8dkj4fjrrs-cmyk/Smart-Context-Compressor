@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ctxc - a small context-compressing proxy for very long coding-agent sessions.
+"""Smart Context Compressor (ctxc) - a small context-compressing proxy for very long coding-agent sessions.
 
 Point an agent's base URL at this proxy. Every request is rewritten so the model
 sees at most `--window` tokens, however long the client-side transcript has grown:
@@ -1113,7 +1113,7 @@ def serve(a):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="ctxc", description="Context-compressing proxy for very long agent sessions.")
+    ap = argparse.ArgumentParser(prog="ctxc", description="Smart Context Compressor: a context-compressing proxy for very long agent sessions.")
     ap.add_argument("--dir", help="store directory (default ~/.ctxc or $CTXC_DIR)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("serve", help="run the proxy")

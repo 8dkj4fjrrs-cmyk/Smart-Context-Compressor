@@ -1,6 +1,6 @@
-# ctxc — context compressor proxy
+# Smart Context Compressor
 
-A small proxy that sits between a coding agent and its model API and keeps every
+Smart Context Compressor (command: `ctxc`) is a small proxy that sits between a coding agent and its model API and keeps every
 request inside a fixed token window (default 100K), however long the session runs.
 
 - One Python file, standard library only. No Node, no build, no certificates.
