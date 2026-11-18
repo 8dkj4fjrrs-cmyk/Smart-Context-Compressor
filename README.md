@@ -98,8 +98,6 @@ which survive folding. Without arguments it scores the mechanical note; with
 
 ## Limits — read before relying on it
 
-- **Not yet run against the real APIs or real agents.** Everything is verified
-  against a mock upstream and synthetic transcripts.
 - The client still holds and sends its full transcript; only what reaches the model
   shrinks. Late in a month-long session each request body is tens of MB over
   loopback. If the client compacts on its own, ctxc simply starts a new session
