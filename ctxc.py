@@ -17,6 +17,7 @@ can be fetched by the agent from its shell: `ctxc recall REF`, `ctxc search WORD
 One file, standard library only.   ctxc serve | recall | search | stats | link
 """
 import argparse
+import collections
 import gzip
 import hashlib
 import http.client
@@ -32,9 +33,9 @@ import time
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 FANIN = 4                       # summaries merged into one when the summary zone is full
 INDEX_CAP = 300 * 1024          # bytes of each stored output that are full-text indexed
 SIGNAL = re.compile(
@@ -696,6 +697,8 @@ class Compressor:
         self.summarizer = summarizer        # callable(ad, body, prompt, ctx) -> text, or None
         self.prepared, self.pending, self.failed = {}, set(), set()
         self.memo = {}                      # (kind, hash, len, budget) -> rewritten tool output
+        self.recent = collections.deque(maxlen=30)      # latest requests, for the web page
+        self.started = time.time()
         self.locks, self.guard = {}, threading.Lock()
         self.stats = {"requests": 0, "raw_tokens": 0, "sent_tokens": 0, "epochs": 0,
                       "model_summaries": 0, "mechanical_summaries": 0}
@@ -946,6 +949,101 @@ class Compressor:
                                               cache_control=dict(found[in_msgs - 1] if in_msgs else found[-1]))
 
 
+PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Context Compressor</title>
+<style>
+:root{--bg:#F6F8FA;--card:#FFFFFF;--line:#E2E8F0;--text:#0F172A;--muted:#5B6676;--accent:#0E7C86;--soft:#E6F6F7;--ok:#16A34A}
+@media (prefers-color-scheme:dark){:root{--bg:#0B1220;--card:#121C2E;--line:#243349;--text:#E6EBF3;--muted:#9AA7B8;--accent:#44C7D1;--soft:#12313A;--ok:#4ADE80}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,"Segoe UI",Helvetica,Arial,sans-serif}
+main{max-width:980px;margin:0 auto;padding:28px 20px 60px}
+h1{font-size:22px;margin:0}h2{font-size:15px;margin:0 0 12px;font-weight:700}
+.top{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:22px}
+.state{color:var(--muted);font-size:14px}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--ok);margin-right:6px}
+.dot.off{background:#DC2626}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-bottom:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin-bottom:14px}
+.tile{margin:0}.num{font-size:28px;font-weight:700;letter-spacing:-.5px}.lab{color:var(--muted);font-size:13px}
+.sub{color:var(--muted);font-size:13px;margin-top:2px}
+table{width:100%;border-collapse:collapse;font-size:14px}th{text-align:left;color:var(--muted);font-weight:600;font-size:12px;padding:0 10px 8px 0}
+td{padding:8px 10px 8px 0;border-top:1px solid var(--line);white-space:nowrap}td.r,th.r{text-align:right}
+.tag{background:var(--soft);color:var(--accent);border-radius:999px;padding:2px 9px;font-size:12px;font-weight:600}
+.empty{color:var(--muted);padding:6px 0}
+code,pre,input{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}
+.cmd{display:flex;gap:10px;align-items:center;margin:8px 0}.cmd span{color:var(--muted);width:190px;flex:none;font-size:14px}
+.cmd code{flex:1;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px 10px;overflow-x:auto;white-space:nowrap}
+button{font:inherit;font-size:13px;border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:8px;padding:7px 12px;cursor:pointer}
+button:hover{border-color:var(--accent);color:var(--accent)}
+.row{display:flex;gap:10px}input{flex:1;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px 11px}
+input:focus{outline:2px solid var(--accent);outline-offset:-1px}
+.hit{display:block;width:100%;text-align:left;margin-top:8px;white-space:normal;line-height:1.4}.hit b{color:var(--accent)}
+pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto;max-height:420px;margin:12px 0 0;white-space:pre-wrap}
+.bar{height:8px;border-radius:999px;background:var(--line);overflow:hidden;margin-top:10px}.bar i{display:block;height:100%;background:var(--accent)}
+</style></head><body><main>
+<div class="top"><h1>Smart Context Compressor</h1><div class="state"><span class="dot" id="dot"></span><span id="state">connecting…</span></div></div>
+
+<div class="tiles">
+  <div class="card tile"><div class="lab">Requests handled</div><div class="num" id="req">–</div><div class="sub" id="up"></div></div>
+  <div class="card tile"><div class="lab">Tokens saved</div><div class="num" id="saved">–</div><div class="bar"><i id="bar" style="width:0"></i></div></div>
+  <div class="card tile"><div class="lab">Sent to the model</div><div class="num" id="sent">–</div><div class="sub" id="raw"></div></div>
+  <div class="card tile"><div class="lab">Notes written</div><div class="num" id="notes">–</div><div class="sub" id="notesub"></div></div>
+</div>
+
+<div class="card"><h2>Connect an agent</h2>
+  <div class="cmd"><span>Claude Code</span><code id="c1"></code><button data-copy="c1">Copy</button></div>
+  <div class="cmd"><span>Other agents: base URL</span><code id="c2"></code><button data-copy="c2">Copy</button></div>
+  <div class="cmd"><span>Another provider</span><code id="c3"></code><button data-copy="c3">Copy</button></div>
+</div>
+
+<div class="card"><h2>Recent requests</h2>
+  <div id="recent"><div class="empty">Nothing yet. Start an agent with the address above and requests will appear here.</div></div>
+</div>
+
+<div class="card"><h2>Search what was compressed away</h2>
+  <div class="row"><input id="q" placeholder="Words to look for, e.g. an error message or a file name" autocomplete="off"><button id="go">Search</button></div>
+  <div id="hits"></div><pre id="view" hidden></pre>
+</div>
+</main>
+<script>
+const $=id=>document.getElementById(id), n=x=>Math.round(x).toLocaleString();
+const short=x=>x>=1e9?(x/1e9).toFixed(2)+"B":x>=1e6?(x/1e6).toFixed(1)+"M":x>=1e3?(x/1e3).toFixed(1)+"K":String(x);
+const el=(tag,text,cls)=>{const e=document.createElement(tag);if(text!=null)e.textContent=text;if(cls)e.className=cls;return e};
+const o=location.origin;
+$("c1").textContent="ANTHROPIC_BASE_URL="+o+" claude";
+$("c2").textContent=o;
+$("c3").textContent=o+"/-/https/HOST/PATH";
+document.querySelectorAll("[data-copy]").forEach(b=>b.onclick=()=>{navigator.clipboard.writeText($(b.dataset.copy).textContent);b.textContent="Copied";setTimeout(()=>b.textContent="Copy",1200)});
+function ago(t){const s=Date.now()/1000-t;return s<60?Math.max(1,Math.round(s))+"s ago":s<3600?Math.round(s/60)+" min ago":Math.round(s/3600)+" h ago"}
+async function tick(){
+  try{
+    const d=await (await fetch("/__ctxc/stats")).json();
+    $("dot").className="dot";$("state").textContent="running · window "+n(d.window)+" tokens · notes: "+(d.summaries==="off"?"mechanical":"written by the model")+" · v"+d.version;
+    $("req").textContent=n(d.requests);$("up").textContent="up "+(d.uptime<3600?Math.round(d.uptime/60)+" min":(d.uptime/3600).toFixed(1)+" h");
+    const pct=d.raw_tokens?100*(1-d.sent_tokens/d.raw_tokens):0;
+    $("saved").textContent=d.raw_tokens?pct.toFixed(1)+"%":"–";$("bar").style.width=pct+"%";
+    $("sent").textContent=short(d.sent_tokens);$("raw").textContent=d.raw_tokens?"instead of "+short(d.raw_tokens):"";
+    $("notes").textContent=n(d.model_summaries+d.mechanical_summaries);
+    $("notesub").textContent=d.model_summaries+" by the model · "+d.mechanical_summaries+" mechanical";
+    if(d.recent.length){
+      const t=el("table"),h=el("tr");[["When"],["API"],["Model"],["Agent sent","r"],["Model received","r"],[""]].forEach(c=>h.appendChild(el("th",c[0],c[1])));t.appendChild(h);
+      d.recent.slice(0,12).forEach(r=>{const tr=el("tr");tr.appendChild(el("td",ago(r.t)));tr.appendChild(el("td",r.api));tr.appendChild(el("td",r.model));
+        tr.appendChild(el("td",n(r.raw),"r"));tr.appendChild(el("td",n(r.sent),"r"));const c=el("td");if(r.folded)c.appendChild(el("span","folded","tag"));tr.appendChild(c);t.appendChild(tr)});
+      $("recent").replaceChildren(t)}
+  }catch(e){$("dot").className="dot off";$("state").textContent="not reachable"}
+}
+async function show(ref,lines){const v=$("view");v.hidden=false;v.textContent="Loading…";
+  const d=await (await fetch("/__ctxc/recall?ref="+encodeURIComponent(ref)+(lines?"&lines="+lines:""))).json();v.textContent=d.text}
+async function search(){const q=$("q").value.trim();if(!q)return;$("view").hidden=true;
+  const d=await (await fetch("/__ctxc/search?q="+encodeURIComponent(q))).json(),box=$("hits");box.replaceChildren();
+  let any=false;d.lines.forEach(l=>{const m=l.match(/^((?:r:[0-9a-f]+|s:\d+))\s*(.*)$/);if(!m)return;any=true;
+    const b=el("button",null,"hit");b.appendChild(el("b",m[1]+"  "));b.appendChild(document.createTextNode(m[2]));const near=m[2].match(/near lines (\d+):(\d+)/);
+    b.onclick=()=>show(m[1],near?Math.max(1,near[1]-5)+":"+(+near[2]+5):"");box.appendChild(b)});
+  if(!any)box.appendChild(el("div","Nothing found for those words.","empty"))}
+$("go").onclick=search;$("q").onkeydown=e=>{if(e.key==="Enter")search()};
+tick();setInterval(tick,3000);
+</script></body></html>"""
+
+
 # ----------------------------------------------------------------------- proxy
 
 def log(msg):
@@ -1022,11 +1120,37 @@ class Proxy(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _page(self, comp):
+        """The built-in web page and its read-only JSON endpoints."""
+        u = urlsplit(self.path)
+        q = {k: v[0] for k, v in parse_qs(u.query).items()}
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+        if self.cfg["host"] in ("127.0.0.1", "localhost", "::1") and host not in ("127.0.0.1", "localhost", "::1"):
+            return self._reply(403, {"error": "the ctxc page only answers on localhost"})   # blocks DNS rebinding
+        store = comp.store
+        if u.path == "/":
+            data = PAGE.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return self.wfile.write(data)
+        with store.lock:
+            if u.path == "/__ctxc/search":
+                return self._reply(200, {"lines": store.search(q.get("q", ""), 12).split("\n")})
+            if u.path == "/__ctxc/recall":
+                return self._reply(200, {"text": store.recall(q.get("ref", ""), q.get("grep") or None,
+                                                              q.get("lines") or None, 8000)})
+            return self._reply(200, dict(comp.stats, version=VERSION, window=comp.window, store=str(store.dir),
+                                         uptime=int(time.time() - comp.started), recent=list(comp.recent),
+                                         summaries=self.cfg["summarizer"]))
+
     def _handle(self):
         self.close_connection = True
         comp = self.cfg["compressor"]
-        if self.path.startswith("/__ctxc/"):
-            return self._reply(200, dict(comp.stats, version=VERSION, window=comp.window))
+        if self.path.startswith("/__ctxc/") or (self.command == "GET" and self.path.split("?")[0] == "/"):
+            return self._page(comp)
         body, url = self._body(), self._route()
         headers = {k: v for k, v in self.headers.items()}
         ad = adapter_for(url) if self.command == "POST" and body else None
@@ -1041,6 +1165,8 @@ class Proxy(BaseHTTPRequestHandler):
                     if raw:
                         body = json.dumps(parsed, ensure_ascii=False, separators=(",", ":")).encode()
                         headers = {k: v for k, v in headers.items() if k.lower() != "content-encoding"}
+                        comp.recent.appendleft({"t": time.time(), "api": ad.name, "model": str(parsed.get("model", "?")),
+                                                "raw": raw, "sent": sent, "folded": epoch})
                         if epoch or self.cfg["verbose"]:
                             log("%s %s: %d → %d tokens%s" % (ad.name, parsed.get("model", "?"), raw, sent,
                                                               "  (epoch)" if epoch else ""))
@@ -1104,11 +1230,13 @@ def serve(a):
     comp = Compressor(store, a.window, a.cli,
                       None if a.summarizer == "off" else make_summarizer(None if a.summarizer == "auto" else a.summarizer),
                       a.wait)
-    Proxy.cfg = {"compressor": comp, "anthropic": a.anthropic_upstream, "openai": a.openai_upstream, "verbose": a.verbose}
+    Proxy.cfg = {"compressor": comp, "anthropic": a.anthropic_upstream, "openai": a.openai_upstream,
+                 "verbose": a.verbose, "host": a.host, "summarizer": a.summarizer}
     srv = ThreadingHTTPServer((a.host, a.port), Proxy)
     srv.daemon_threads = True
     log("ctxc %s on http://%s:%d  window=%d  store=%s  summaries=%s" % (
         VERSION, a.host, srv.server_address[1], a.window, store.dir, a.summarizer))
+    log("open http://%s:%d in a browser to see what it is doing" % (a.host, srv.server_address[1]))
     return srv
 
 

@@ -8,7 +8,7 @@
 
 ![license](https://img.shields.io/badge/license-MIT-blue) ![python](https://img.shields.io/badge/python-3.9%2B-blue) ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![status](https://img.shields.io/badge/status-prototype-orange)
 
-`python3 ctxc.py serve` · then point your agent's base URL at `http://127.0.0.1:8787`
+`python3 ctxc.py serve` · then point your agent's base URL at `http://127.0.0.1:8787` · open the same address in a browser to watch it work
 
 ---
 
@@ -156,6 +156,14 @@ On the fact-retention check (`tests/quality.py`), the mechanical fallback note k
 **How are tokens counted?** Estimated as characters ÷ 3.5, which is deliberately conservative.
 
 ## Running the proxy
+
+### Web page
+
+Open `http://127.0.0.1:8787` in a browser while the proxy is running.
+
+![The built-in web page](docs/web-ui.png)
+
+It is one read-only page: how much has been saved, the latest requests (what the agent sent and what the model received), the address to give your agent, and a search box over everything that was compressed away. There is nothing to configure, and it only answers on localhost.
 
 ### Flags
 

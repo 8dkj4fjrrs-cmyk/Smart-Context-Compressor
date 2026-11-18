@@ -229,6 +229,7 @@ class ProxyTest(unittest.TestCase):
         self.proxy = ctxc.serve(SimpleNamespace(
             dir=self.tmp.name, window=12000, cli="ctxc", summarizer="auto", anthropic_upstream=up_url,
             openai_upstream=up_url + "/v1", host="127.0.0.1", port=0, verbose=False, wait=5.0))
+        self.proxy.RequestHandlerClass.cfg["host"] = "127.0.0.1"
         for s in (self.up, self.proxy):
             threading.Thread(target=s.serve_forever, daemon=True).start()
         self.port = self.proxy.server_address[1]
@@ -280,6 +281,36 @@ class ProxyTest(unittest.TestCase):
         status, _, data = self.post("/__ctxc/stats", {})
         stats = json.loads(data)
         self.assertGreater(stats["raw_tokens"], 5 * stats["sent_tokens"])
+
+    def get(self, path, host=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        conn.request("GET", path, headers={"Host": host} if host else {})
+        resp = conn.getresponse()
+        out = resp.status, resp.getheader("Content-Type"), resp.read().decode()
+        conn.close()
+        return out
+
+    def test_web_page(self):
+        status, ctype, html = self.get("/")
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", ctype)
+        self.assertIn("<title>Smart Context Compressor</title>", html)
+        self.assertNotIn("http://", html.replace("http://127.0.0.1", ""))     # no external assets
+        wire = sim.Wire("anthropic")
+        for ev in sim.events(40):
+            wire.add(ev)
+            if ev[0] != "say":
+                self.post("/v1/messages", wire.body(), {"x-api-key": "sk-test"})
+        stats = json.loads(self.get("/__ctxc/stats")[2])
+        self.assertEqual(stats["recent"][0]["api"], "anthropic")
+        self.assertGreater(stats["recent"][0]["raw"], stats["recent"][0]["sent"])
+        self.assertNotIn("sk-test", json.dumps(stats))                        # credentials never surface
+        lines = json.loads(self.get("/__ctxc/search?q=pytest")[2])["lines"]
+        ref = lines[0].split(" ")[0]
+        self.assertRegex(ref, r"^(r:[0-9a-f]+|s:\d+)$")
+        self.assertIn(ref.split(":")[1], json.loads(self.get("/__ctxc/recall?ref=" + ref)[2])["text"])
+        self.assertEqual(self.get("/__ctxc/stats", host="evil.example.com")[0], 403)   # DNS-rebinding guard
+        self.assertEqual(self.get("/", host="evil.example.com")[0], 403)
 
     def test_routing_gzip_and_fail_open(self):
         up = "127.0.0.1:%d" % self.up.server_address[1]
