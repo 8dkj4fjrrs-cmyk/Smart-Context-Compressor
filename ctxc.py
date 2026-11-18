@@ -888,10 +888,15 @@ class Compressor:
         if not self.summarizer or key in self.prepared or key in self.pending or key in self.failed:
             return
         self.pending.add(key)
+        try:                                    # build the prompt here: the worker thread must not touch the store
+            prompt = prompt() if callable(prompt) else prompt
+        except Exception:
+            self.pending.discard(key)
+            raise
 
         def work():
             try:
-                text = self.summarizer(ad, body, prompt() if callable(prompt) else prompt, ctx)
+                text = self.summarizer(ad, body, prompt, ctx)
                 if text and text.strip():
                     self.prepared[key] = text.strip()
                 else:
