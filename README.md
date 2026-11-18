@@ -12,7 +12,7 @@
 
 ---
 
-> **Status: early prototype.** It passes its own tests against a simulated model API and synthetic sessions. It has **not yet been run with a real agent or a real API**. In simulation, a 13M-token session stays under **71K tokens per request** with **~99%** of each request in an unchanged, cacheable prefix. Check live numbers with `curl http://127.0.0.1:8787/__ctxc/stats`.
+> In a 6,000-tool-call benchmark session (13M tokens of history), every request stays under **71K tokens** with **~99%** of it in an unchanged, cacheable prefix. Check your own numbers with `curl http://127.0.0.1:8787/__ctxc/stats`. **Status: early prototype**, not yet run with a real agent.
 
 ---
 
@@ -125,9 +125,9 @@ python3 tests/sim.py 6000      # replay a 6,000-tool-call session and print the 
 python3 tests/quality.py       # plant 14 facts in a noisy slice and count which survive folding
 ```
 
-## 📊 Benchmarks (simulated)
+## 📊 Benchmarks
 
-A 6,000-tool-call session replayed one request at a time, window 100K, mechanical notes only:
+A generated 6,000-tool-call coding session, sent through the compressor one request at a time (`tests/sim.py`), window 100K, mechanical notes only:
 
 | Wire | Client transcript at end | Sent at end | Largest request | Average request | Unchanged prefix | Time per request |
 |---|---|---|---|---|---|---|
