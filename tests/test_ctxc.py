@@ -312,6 +312,32 @@ class ProxyTest(unittest.TestCase):
         self.assertEqual(self.get("/__ctxc/stats", host="evil.example.com")[0], 403)   # DNS-rebinding guard
         self.assertEqual(self.get("/", host="evil.example.com")[0], 403)
 
+    def test_run_launches_an_agent_through_the_proxy(self):
+        child = (
+            "import os, sys, json, http.client\n"
+            "from urllib.parse import urlsplit\n"
+            "u = urlsplit(os.environ['ANTHROPIC_BASE_URL'])\n"
+            "assert os.environ['OPENAI_BASE_URL'] == os.environ['ANTHROPIC_BASE_URL'] + '/v1'\n"
+            "c = http.client.HTTPConnection(u.hostname, u.port, timeout=20)\n"
+            "c.request('POST', '/v1/messages', body=json.dumps({'model': 'm', 'stream': True, 'messages': "
+            "[{'role': 'user', 'content': 'hi from the agent'}]}), headers={'Content-Type': 'application/json'})\n"
+            "r = c.getresponse(); r.read()\n"
+            "print('agent saw', r.status, sys.argv[1], os.environ['CTXC_DIR'])\n"
+            "sys.exit(7)\n")
+        up = "http://127.0.0.1:%d" % self.up.server_address[1]
+        env = dict(__import__("os").environ, ANTHROPIC_BASE_URL=up)      # the user's existing provider setting
+        proc = subprocess.run([sys.executable, SCRIPT, "--dir", self.tmp.name + "/run", "run", "--port", "0",
+                               "--summarizer", "off", "--", sys.executable, "-c", child, "--resume"],
+                              capture_output=True, text=True, timeout=60, env=env)
+        self.assertEqual(proc.returncode, 7)                                     # the agent's exit code
+        self.assertIn("agent saw 200 --resume " + self.tmp.name + "/run", proc.stdout)   # its arguments pass through
+        self.assertIn("watch it at http://127.0.0.1:", proc.stderr)
+        self.assertNotIn("[ctxc ", proc.stderr)                                  # log goes to a file, not the screen
+        self.assertIn("window=100000", open(self.tmp.name + "/run/ctxc.log").read())
+        self.assertEqual(Upstream.seen[-1][2]["messages"][0]["content"], "hi from the agent")   # reached the old upstream
+        missing = subprocess.run([sys.executable, SCRIPT, "run", "no-such-agent-xyz"], capture_output=True, text=True)
+        self.assertEqual(missing.returncode, 127)
+
     def test_routing_gzip_and_fail_open(self):
         up = "127.0.0.1:%d" % self.up.server_address[1]
         chat = {"model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]}

@@ -8,7 +8,7 @@
 
 ![license](https://img.shields.io/badge/license-MIT-blue) ![python](https://img.shields.io/badge/python-3.9%2B-blue) ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![status](https://img.shields.io/badge/status-prototype-orange)
 
-`python3 ctxc.py serve` · then point your agent's base URL at `http://127.0.0.1:8787` · open the same address in a browser to watch it work
+`ctxc run claude` · one command starts the compressor and your agent together · open `http://127.0.0.1:8787` in a browser to watch it work
 
 ---
 
@@ -66,9 +66,9 @@ The agent runs these in its normal shell tool. Every digest and note carries the
 
 | Client | Use |
 |---|---|
-| Claude Code | Option 1: `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` |
+| Claude Code | `ctxc run claude` |
 | Codex CLI | Option 1: a model provider with `base_url = "http://127.0.0.1:8787/v1"` and `wire_api = "responses"` |
-| aider, opencode and other OpenAI- or Anthropic-compatible clients | Option 1: base URL `http://127.0.0.1:8787` |
+| aider, opencode and other clients that read `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` | `ctxc run <agent>` |
 | ZCode, or any client talking to Z.ai, OpenRouter or a relay | Option 2: the `/-/` upstream prefix |
 | Cursor | Probably not supported locally: its requests appear to go through Cursor's own servers, which cannot reach `127.0.0.1` (unverified) |
 
@@ -85,6 +85,19 @@ python3 ctxc.py link        # puts a `ctxc` launcher in ~/.local/bin
 Needs Python 3.9 or newer (developed on 3.13) with SQLite, which ships with Python. Nothing to `pip install`.
 
 ## Quickstart
+
+The quickest way is one command. It starts the compressor, points the agent at it, and stops the compressor when the agent exits:
+
+```sh
+ctxc run claude                 # anything after the agent's name is passed to it: ctxc run claude --resume
+```
+
+- It sets `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` for that agent only, so it works with any agent that reads one of them.
+- If you already had one of those set (for another provider or a relay), that address is kept as the upstream.
+- Options go before the agent: `ctxc run --window 60000 --summarizer off claude`.
+- The agent's screen stays clean; the compressor's log goes to `~/.ctxc/ctxc.log`.
+
+To run the compressor on its own instead:
 
 - **Option 1 — Base URL.** For clients that talk to Anthropic or OpenAI directly.
 - **Option 2 — Upstream prefix.** For any other provider.
@@ -168,7 +181,7 @@ It is one read-only page: how much has been saved, the latest requests (what the
 ### Flags
 
 ```sh
-ctxc serve
+ctxc serve        # `ctxc run AGENT` takes the same flags
   --port 8787                 # listen port
   --host 127.0.0.1            # listen address
   --window 100000             # most tokens the model should ever see

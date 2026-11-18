@@ -14,7 +14,7 @@ epochs, so between epochs the prompt prefix is byte-stable and stays cacheable.
 Responses are streamed back untouched. Everything removed is kept in SQLite and
 can be fetched by the agent from its shell: `ctxc recall REF`, `ctxc search WORDS`.
 
-One file, standard library only.   ctxc serve | recall | search | stats | link
+One file, standard library only.   ctxc run AGENT | serve | recall | search | stats | link
 """
 import argparse
 import collections
@@ -25,8 +25,10 @@ import json
 import math
 import os
 import re
+import shutil
 import sqlite3
 import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -35,7 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 FANIN = 4                       # summaries merged into one when the summary zone is full
 INDEX_CAP = 300 * 1024          # bytes of each stored output that are full-text indexed
 SIGNAL = re.compile(
@@ -1051,9 +1053,17 @@ tick();setInterval(tick,3000);
 
 # ----------------------------------------------------------------------- proxy
 
+LOG_FILE = None      # `ctxc run` logs here so the agent's own screen stays clean
+
+
 def log(msg):
-    sys.stderr.write("[ctxc %s] %s\n" % (time.strftime("%H:%M:%S"), msg))
-    sys.stderr.flush()
+    line = "[ctxc %s] %s\n" % (time.strftime("%H:%M:%S"), msg)
+    if LOG_FILE:
+        with open(LOG_FILE, "a") as f:
+            f.write(line)
+    else:
+        sys.stderr.write(line)
+        sys.stderr.flush()
 
 
 HOP = {"host", "content-length", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -1232,6 +1242,8 @@ def make_summarizer(model):
 
 def serve(a):
     store = Store(a.dir)
+    if not a.cli:           # what the model is told to type for recall: `ctxc` if installed, else the full path
+        a.cli = "ctxc" if shutil.which("ctxc") else '"%s" "%s"' % (sys.executable or "python3", Path(__file__).resolve())
     comp = Compressor(store, a.window, a.cli,
                       None if a.summarizer == "off" else make_summarizer(None if a.summarizer == "auto" else a.summarizer),
                       a.wait)
@@ -1245,23 +1257,82 @@ def serve(a):
     return srv
 
 
+def _is_ctxc(host, port):
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=2)
+        conn.request("GET", "/__ctxc/stats")
+        return "window" in json.loads(conn.getresponse().read())
+    except Exception:
+        return False
+
+
+def run(a):
+    """Start the proxy, launch an agent pointed at it, stop the proxy when the agent exits."""
+    global LOG_FILE
+    cmd = a.command[1:] if a.command[:1] == ["--"] else a.command
+    if not cmd:
+        print("ctxc: say which agent to run, e.g.  ctxc run claude", file=sys.stderr)
+        return 2
+    if not shutil.which(cmd[0]):
+        print("ctxc: command not found: %s" % cmd[0], file=sys.stderr)
+        return 127
+    directory = Path(a.dir or os.environ.get("CTXC_DIR") or Path.home() / ".ctxc")
+    directory.mkdir(parents=True, exist_ok=True)
+    LOG_FILE = str(directory / "ctxc.log")
+    # a base URL the user already had set is where the agent was going: keep it as the upstream
+    for var, attr, default in (("ANTHROPIC_BASE_URL", "anthropic_upstream", "https://api.anthropic.com"),
+                               ("OPENAI_BASE_URL", "openai_upstream", "https://api.openai.com")):
+        old = os.environ.get(var, "")
+        u = urlsplit(old)
+        ours = u.hostname in ("127.0.0.1", "localhost") and (u.port == a.port or _is_ctxc(u.hostname, u.port or 80))
+        if old and u.hostname and getattr(a, attr) == default and not ours:     # never chain ctxc to itself
+            setattr(a, attr, old)
+    srv, port = None, a.port
+    try:
+        srv = serve(a)
+    except OSError:
+        if not (a.port and _is_ctxc(a.host, a.port)):      # busy, and not by another ctxc: take a free port
+            a.port = 0
+            srv = serve(a)
+    if srv:
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = "http://%s:%d" % (a.host, port)
+    env = dict(os.environ, ANTHROPIC_BASE_URL=base, OPENAI_BASE_URL=base + "/v1", CTXC_DIR=str(directory))
+    print("ctxc: compressing for `%s`%s · watch it at %s" % (
+        cmd[0], "" if srv else " (using the ctxc already running)", base), file=sys.stderr)
+    proc = subprocess.Popen(cmd, env=env)
+    while True:
+        try:
+            code = proc.wait()
+            break
+        except KeyboardInterrupt:           # Ctrl-C belongs to the agent; keep waiting for it
+            continue
+    if srv:
+        srv.shutdown()
+    return code if code >= 0 else 128 - code
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="ctxc", description="Smart Context Compressor: a context-compressing proxy for very long agent sessions.")
     ap.add_argument("--dir", help="store directory (default ~/.ctxc or $CTXC_DIR)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("serve", help="run the proxy")
-    p.add_argument("--port", type=int, default=8787)
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--window", type=int, default=100000, help="max tokens the model should ever see")
-    p.add_argument("--summarizer", default="auto",
-                   help="auto = notes written in the background by the request's own model; "
-                        "off = mechanical notes only, no extra API calls; or a model name to use")
-    p.add_argument("--wait", type=float, default=20.0,
-                   help="max seconds a request may wait for a model-written note before a mechanical one is used")
-    p.add_argument("--anthropic-upstream", default=os.environ.get("CTXC_ANTHROPIC_UPSTREAM", "https://api.anthropic.com"))
-    p.add_argument("--openai-upstream", default=os.environ.get("CTXC_OPENAI_UPSTREAM", "https://api.openai.com"))
-    p.add_argument("--cli", default="ctxc", help="command name shown to the model for recall/search")
-    p.add_argument("--verbose", action="store_true", help="log every request, not only epochs")
+    for name, text in (("serve", "run the proxy"), ("run", "run an agent through the proxy:  ctxc run claude")):
+        p = sub.add_parser(name, help=text)
+        p.add_argument("--port", type=int, default=8787)
+        p.add_argument("--host", default="127.0.0.1")
+        p.add_argument("--window", type=int, default=100000, help="max tokens the model should ever see")
+        p.add_argument("--summarizer", default="auto",
+                       help="auto = notes written in the background by the request's own model; "
+                            "off = mechanical notes only, no extra API calls; or a model name to use")
+        p.add_argument("--wait", type=float, default=20.0,
+                       help="max seconds a request may wait for a model-written note before a mechanical one is used")
+        p.add_argument("--anthropic-upstream", default=os.environ.get("CTXC_ANTHROPIC_UPSTREAM", "https://api.anthropic.com"))
+        p.add_argument("--openai-upstream", default=os.environ.get("CTXC_OPENAI_UPSTREAM", "https://api.openai.com"))
+        p.add_argument("--cli", help="command name shown to the model for recall/search (default: found automatically)")
+        p.add_argument("--verbose", action="store_true", help="log every request, not only epochs")
+        if name == "run":
+            p.add_argument("command", nargs=argparse.REMAINDER, help="the agent and its arguments")
     p = sub.add_parser("recall", help="print an archived original: r:HASH or s:NUMBER")
     p.add_argument("ref")
     p.add_argument("--grep")
@@ -1274,6 +1345,8 @@ def main(argv=None):
     p = sub.add_parser("link", help="install a `ctxc` launcher into ~/.local/bin")
     p.add_argument("--bin", default=str(Path.home() / ".local" / "bin"))
     a = ap.parse_args(argv)
+    if a.cmd == "run":
+        return run(a)
     if a.cmd == "serve":
         srv = serve(a)
         try:
