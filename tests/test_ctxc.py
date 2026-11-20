@@ -135,6 +135,7 @@ class SessionTest(unittest.TestCase):
             body = wire.body()
             comp.compress(wire.ad, body, {}, {"url": "x", "headers": {}})
             self.assertEqual(comp.stats["model_summaries"] > 0, expect_model)
+            self.assertEqual(comp.stats["notes_timed_out"] > 0, not expect_model)     # counted, and logged
             self.assertEqual("SLOWNOTE" in json.dumps(body), expect_model)
             sim.check_valid("chat", body)
 

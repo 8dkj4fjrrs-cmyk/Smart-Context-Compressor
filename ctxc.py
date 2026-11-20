@@ -38,7 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-VERSION = "0.6.1"
+VERSION = "0.7.0"
 FANIN = 4                       # summaries merged into one when the summary zone is full
 INDEX_CAP = 300 * 1024          # bytes of each stored output that are full-text indexed
 SIGNAL = re.compile(
@@ -695,7 +695,7 @@ def mechanical(ad, msgs, budget):
     return clip("\n".join("%s:\n%s" % (h, "\n".join(ls)) for h, ls in sections if ls), budget)
 
 class Compressor:
-    def __init__(self, store, window=100000, cli="ctxc", summarizer=None, wait=20.0):
+    def __init__(self, store, window=100000, cli="ctxc", summarizer=None, wait=45.0):
         self.store, self.window, self.cli, self.wait = store, window, cli, wait
         self.summarizer = summarizer        # callable(ad, body, prompt, ctx) -> text, or None
         self.prepared, self.pending, self.failed = {}, set(), set()
@@ -704,7 +704,7 @@ class Compressor:
         self.started = time.time()
         self.locks, self.guard = {}, threading.Lock()
         self.stats = {"requests": 0, "raw_tokens": 0, "sent_tokens": 0, "epochs": 0,
-                      "model_summaries": 0, "mechanical_summaries": 0}
+                      "model_summaries": 0, "mechanical_summaries": 0, "notes_timed_out": 0}
 
     def _memo(self, kind, text, budget, make):
         key = (kind, hash(text), len(text), budget)
@@ -904,6 +904,7 @@ class Compressor:
                     self.prepared[key] = text.strip()
                 else:
                     self.failed.add(key)
+                    log("the model returned an empty note; a mechanical note will be used")
             except Exception as e:
                 self.failed.add(key)            # do not retry this range on every request
                 log("summariser failed (%s); a mechanical note will be used" % e)
@@ -918,6 +919,10 @@ class Compressor:
         deadline = time.time() + self.wait
         while key in self.pending and time.time() < deadline:
             time.sleep(0.02)
+        if key in self.pending:                 # still being written: do not hold the agent up any longer
+            self.stats["notes_timed_out"] += 1
+            log("a note was not ready after %ds, so a mechanical note was used. To avoid this, give notes more "
+                "time (--wait 90) or a faster model (--summarizer MODEL)" % self.wait)
         return self.prepared.pop(key, None)
 
     def _prepare(self, ad, body, msgs, st, sid, w, ctx):
@@ -1025,13 +1030,13 @@ function ago(t){const s=Date.now()/1000-t;return s<60?Math.max(1,Math.round(s))+
 async function tick(){
   try{
     const d=await (await fetch("/__ctxc/stats")).json();
-    $("dot").className="dot";$("state").textContent="running · window "+n(d.window)+" tokens · notes: "+(d.summaries==="off"?"mechanical":"written by the model")+" · v"+d.version;
+    $("dot").className="dot";$("state").textContent="running · window "+n(d.window)+" tokens · notes: "+(d.summaries==="off"?"mechanical":d.summaries==="auto"?"written by the model":"written by "+d.summaries)+" · v"+d.version;
     $("req").textContent=n(d.requests);$("up").textContent="up "+(d.uptime<3600?Math.round(d.uptime/60)+" min":(d.uptime/3600).toFixed(1)+" h");
     const pct=d.raw_tokens?100*(1-d.sent_tokens/d.raw_tokens):0;
     $("saved").textContent=d.raw_tokens?pct.toFixed(1)+"%":"–";$("bar").style.width=pct+"%";
     $("sent").textContent=short(d.sent_tokens);$("raw").textContent=d.raw_tokens?"instead of "+short(d.raw_tokens):"";
     $("notes").textContent=n(d.model_summaries+d.mechanical_summaries);
-    $("notesub").textContent=d.model_summaries+" by the model · "+d.mechanical_summaries+" mechanical";
+    $("notesub").textContent=d.model_summaries+" by the model · "+d.mechanical_summaries+" mechanical"+(d.notes_timed_out?" ("+d.notes_timed_out+" timed out)":"");
     if(d.recent.length){
       const t=el("table"),h=el("tr");[["When"],["API"],["Model"],["Agent sent","r"],["Model received","r"],[""]].forEach(c=>h.appendChild(el("th",c[0],c[1])));t.appendChild(h);
       d.recent.slice(0,12).forEach(r=>{const tr=el("tr");tr.appendChild(el("td",ago(r.t)));tr.appendChild(el("td",r.api));tr.appendChild(el("td",r.model));
@@ -1346,7 +1351,13 @@ def _service(action, args=None, logfile=None):
         if mac:
             domain = "gui/%d" % os.getuid()
             sh("launchctl", "bootout", "%s/%s" % (domain, LABEL))
-            ok = sh("launchctl", "bootstrap", domain, str(path)) == 0 or sh("launchctl", "load", "-w", str(path)) == 0
+            ok = False
+            for _ in range(4):                  # the old instance may take a moment to go away
+                ok = sh("launchctl", "bootstrap", domain, str(path)) == 0
+                if ok:
+                    break
+                time.sleep(1)
+            ok = ok or sh("launchctl", "load", "-w", str(path)) == 0
         else:
             sh("systemctl", "--user", "daemon-reload")
             ok = sh("systemctl", "--user", "enable", "ctxc.service") == 0 and \
@@ -1457,9 +1468,10 @@ def main(argv=None):
         p.add_argument("--host", default="127.0.0.1")
         p.add_argument("--window", type=int, default=100000, help="max tokens the model should ever see")
         p.add_argument("--summarizer", default="auto",
-                       help="auto = notes written in the background by the request's own model; "
-                            "off = mechanical notes only, no extra API calls; or a model name to use")
-        p.add_argument("--wait", type=float, default=20.0,
+                       help="who writes the notes: auto = the same model the agent is using (best notes); "
+                            "a model name = that model instead (pick a faster, cheaper one); "
+                            "off = mechanical notes only, no extra API calls")
+        p.add_argument("--wait", type=float, default=45.0,
                        help="max seconds a request may wait for a model-written note before a mechanical one is used")
         p.add_argument("--anthropic-upstream", default=os.environ.get("CTXC_ANTHROPIC_UPSTREAM", "https://api.anthropic.com"))
         p.add_argument("--openai-upstream", default=os.environ.get("CTXC_OPENAI_UPSTREAM", "https://api.openai.com"))

@@ -182,7 +182,7 @@ On the fact-retention check (`tests/quality.py`), the mechanical fallback note k
 
 **What if the proxy gets something wrong?** It fails open. If parsing or compression raises an error, the original request is forwarded unchanged and the error is logged.
 
-**Can a request stall?** If a note is not ready when it is needed, the request waits up to `--wait` seconds (default 20) and then uses a mechanical note.
+**Can a request stall?** If a note is not ready when it is needed, the request waits up to `--wait` seconds (default 45) and then uses a mechanical note. The web page and the log show when that happens. See [Notes: quality, speed and cost](#notes-quality-speed-and-cost).
 
 **Is anything lost?** Not from the archive. The model's view is lossy by design; the originals stay in `~/.ctxc/ctx.db`.
 
@@ -210,12 +210,27 @@ ctxc serve        # `ctxc run AGENT` takes the same flags
   --host 127.0.0.1            # listen address
   --window 100000             # most tokens the model should ever see
   --summarizer auto           # auto | off | a model name to write notes with
-  --wait 20                   # max seconds a request waits for a note
+  --wait 45                   # max seconds a request waits for a note
   --anthropic-upstream URL    # default https://api.anthropic.com
   --openai-upstream URL       # default https://api.openai.com
   --verbose                   # log every request, not only folds
 ctxc --dir PATH ...           # store location (default ~/.ctxc, or $CTXC_DIR)
 ```
+
+### Notes: quality, speed and cost
+
+Who writes the notes is your choice. All three work with `serve`, `run` and `on`:
+
+| You want | Use | Trade-off |
+|---|---|---|
+| The best notes (default) | `--summarizer auto` | The agent's own model writes them. A large model can take a while, so a request may pause up to `--wait` seconds. |
+| Best notes, and never fall back | `--summarizer auto --wait 120` | Same quality; an occasional longer pause in place of a mechanical note. |
+| Faster and cheaper notes | `--summarizer MODEL` | Notes are written by the model you name (a small, fast one), while the agent keeps its own model. |
+| No extra API calls at all | `--summarizer off` | Mechanical notes only: instant and free, but less detailed. |
+
+If a note is not ready within `--wait`, a mechanical note is used for that fold, the log says so, and the web page counts it as "timed out".
+
+To change this while using `ctxc on`, run it again with the new options, for example `ctxc on --summarizer MODEL`.
 
 ### Debugging
 
