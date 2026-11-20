@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smart-context-compressor"
+dynamic = ["version"]
+description = "One-file local proxy that compresses a coding agent's conversation before it reaches the model, and keeps every original."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Oscar hird" }]
+keywords = ["claude-code", "codex", "llm", "context-window", "context-compression", "proxy", "coding-agents"]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/8dkj4fjrrs-cmyk/Smart-Context-Compressor"
+Issues = "https://github.com/8dkj4fjrrs-cmyk/Smart-Context-Compressor/issues"
+
+[project.scripts]
+ctxc = "ctxc:main"
+
+[tool.setuptools]
+py-modules = ["ctxc"]
+
+[tool.setuptools.dynamic]
+version = { attr = "ctxc.VERSION" }

@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .ctxc/
+build/
+dist/
+*.egg-info/

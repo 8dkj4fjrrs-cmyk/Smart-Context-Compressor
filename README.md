@@ -77,12 +77,20 @@ The Codex and ZCode rows follow those clients' documentation; if a setting diffe
 ## Install
 
 ```sh
-git clone https://github.com/8dkj4fjrrs-cmyk/Smart-Compressor-.git
-cd Smart-Compressor-
-python3 ctxc.py link        # puts a `ctxc` launcher in ~/.local/bin
+pipx install git+https://github.com/8dkj4fjrrs-cmyk/Smart-Context-Compressor.git
 ```
 
-Needs Python 3.9 or newer (developed on 3.13) with SQLite, which ships with Python. Nothing to `pip install`.
+That gives you the `ctxc` command. Plain `pip install` with the same address works too.
+
+Or without installing anything, since it is a single file:
+
+```sh
+git clone https://github.com/8dkj4fjrrs-cmyk/Smart-Context-Compressor.git
+cd Smart-Context-Compressor
+python3 ctxc.py run claude
+```
+
+Needs Python 3.9 or newer (developed on 3.13) with SQLite, which ships with Python. There are no dependencies.
 
 ## Quickstart
 
