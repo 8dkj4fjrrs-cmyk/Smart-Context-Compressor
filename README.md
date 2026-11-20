@@ -66,7 +66,8 @@ The agent runs these in its normal shell tool. Every digest and note carries the
 
 | Client | Use |
 |---|---|
-| Claude Code | `ctxc run claude` |
+| Claude Code in a terminal | `ctxc run claude` |
+| T3 Code, Conductor or another harness driving Claude Code | `ctxc on` |
 | Codex CLI | Option 1: a model provider with `base_url = "http://127.0.0.1:8787/v1"` and `wire_api = "responses"` |
 | aider, opencode and other clients that read `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` | `ctxc run <agent>` |
 | ZCode, or any client talking to Z.ai, OpenRouter or a relay | Option 2: the `/-/` upstream prefix |
@@ -104,6 +105,19 @@ ctxc run claude                 # anything after the agent's name is passed to i
 - If you already had one of those set (for another provider or a relay), that address is kept as the upstream.
 - Options go before the agent: `ctxc run --window 60000 --summarizer off claude`.
 - The agent's screen stays clean; the compressor's log goes to `~/.ctxc/ctxc.log`.
+
+### Harnesses (T3 Code, Conductor and other apps that start the agent for you)
+
+A harness launches the agent itself, so there is no command to put `ctxc run` in front of. Turn the compressor on once and leave it:
+
+```sh
+ctxc on        # keeps the compressor running in the background and points Claude Code at it
+ctxc off       # puts everything back
+```
+
+- `ctxc on` installs a small background service (launchd on macOS, systemd on Linux) and sets `ANTHROPIC_BASE_URL` in `~/.claude/settings.json`, so every Claude Code session goes through the compressor, whichever app started it.
+- Claude Code is only pointed at the compressor after it has been confirmed running. A provider address you already had there is kept as the upstream and restored by `ctxc off`.
+- Restart the harness afterwards. This currently covers harnesses driving **Claude Code**; other agents inside a harness still need their own base-URL setting.
 
 To run the compressor on its own instead:
 

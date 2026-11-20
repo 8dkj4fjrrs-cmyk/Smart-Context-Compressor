@@ -338,6 +338,55 @@ class ProxyTest(unittest.TestCase):
         missing = subprocess.run([sys.executable, SCRIPT, "run", "no-such-agent-xyz"], capture_output=True, text=True)
         self.assertEqual(missing.returncode, 127)
 
+    def test_on_and_off(self):
+        import os
+        home = self.tmp.name + "/home"
+        os.makedirs(home + "/.claude")
+        settings = home + "/.claude/settings.json"
+        with open(settings, "w") as f:
+            json.dump({"model": "opus", "env": {"FOO": "1", "ANTHROPIC_BASE_URL": "https://relay.example.com/api"}}, f)
+        env = dict(os.environ, HOME=home)
+        cli = lambda *args: subprocess.run([sys.executable, SCRIPT, "--dir", home + "/.ctxc"] + list(args),
+                                           capture_output=True, text=True, timeout=60, env=env)
+        # nothing listening: the agent's settings must not be touched
+        dead = cli("on", "--no-service", "--port", "1")
+        self.assertEqual(dead.returncode, 1)
+        self.assertIn("left untouched", dead.stdout)
+        self.assertEqual(json.load(open(settings))["env"]["ANTHROPIC_BASE_URL"], "https://relay.example.com/api")
+        # proxy up (the one this test class started): settings are pointed at it, everything else kept
+        for _ in range(2):                                               # running it twice changes nothing
+            on = cli("on", "--no-service", "--port", str(self.port))
+            self.assertEqual(on.returncode, 0, on.stdout + on.stderr)
+        data = json.load(open(settings))
+        self.assertEqual(data, {"model": "opus", "env": {"FOO": "1", "ANTHROPIC_BASE_URL": "http://127.0.0.1:%d" % self.port}})
+        self.assertIn("upstream: https://relay.example.com/api", on.stdout)
+        self.assertEqual(cli("off", "--no-service").returncode, 0)
+        self.assertEqual(json.load(open(settings))["env"]["ANTHROPIC_BASE_URL"], "https://relay.example.com/api")
+        # with no previous value and no file: created, then removed cleanly
+        os.remove(settings)
+        self.assertEqual(cli("on", "--no-service", "--port", str(self.port)).returncode, 0)
+        self.assertEqual(json.load(open(settings)), {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:%d" % self.port}})
+        cli("off", "--no-service")
+        self.assertEqual(json.load(open(settings)), {})
+        # broken settings file: refuse, change nothing
+        open(settings, "w").write("{broken")
+        self.assertEqual(cli("on", "--no-service", "--port", str(self.port)).returncode, 1)
+        self.assertEqual(open(settings).read(), "{broken")
+
+    def test_service_definitions(self):
+        import plistlib
+        from unittest import mock
+        args = ["/usr/bin/python3", "/opt/my tools/ctxc.py", "serve", "--port", "8787"]
+        with mock.patch.object(sys, "platform", "darwin"):
+            plist = plistlib.loads(ctxc._service_text(args, "/tmp/ctxc.log").encode())
+            self.assertEqual(plist["ProgramArguments"], args)
+            self.assertTrue(plist["KeepAlive"] and plist["RunAtLoad"])
+            self.assertTrue(str(ctxc._service_file()).endswith("Library/LaunchAgents/" + ctxc.LABEL + ".plist"))
+        with mock.patch.object(sys, "platform", "linux"):
+            unit = ctxc._service_text(args, "/tmp/ctxc.log")
+            self.assertIn('ExecStart="/usr/bin/python3" "/opt/my tools/ctxc.py" "serve" "--port" "8787"', unit)
+            self.assertIn("Restart=always", unit)
+
     def test_routing_gzip_and_fail_open(self):
         up = "127.0.0.1:%d" % self.up.server_address[1]
         chat = {"model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]}

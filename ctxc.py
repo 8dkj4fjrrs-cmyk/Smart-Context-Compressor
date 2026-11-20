@@ -14,7 +14,7 @@ epochs, so between epochs the prompt prefix is byte-stable and stays cacheable.
 Responses are streamed back untouched. Everything removed is kept in SQLite and
 can be fetched by the agent from its shell: `ctxc recall REF`, `ctxc search WORDS`.
 
-One file, standard library only.   ctxc run AGENT | serve | recall | search | stats | link
+One file, standard library only.   ctxc run AGENT | on | off | serve | recall | search | stats | link
 """
 import argparse
 import collections
@@ -24,6 +24,7 @@ import http.client
 import json
 import math
 import os
+import plistlib
 import re
 import shutil
 import sqlite3
@@ -37,7 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 FANIN = 4                       # summaries merged into one when the summary zone is full
 INDEX_CAP = 300 * 1024          # bytes of each stored output that are full-text indexed
 SIGNAL = re.compile(
@@ -1313,11 +1314,143 @@ def run(a):
     return code if code >= 0 else 128 - code
 
 
+# ---- always-on mode, for GUI harnesses (T3 Code, Conductor, ...) that start the agent themselves
+
+LABEL = "com.smart-context-compressor.ctxc"
+
+
+def _service_file():
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "LaunchAgents" / (LABEL + ".plist")
+    return Path.home() / ".config" / "systemd" / "user" / "ctxc.service"
+
+
+def _service_text(args, logfile):
+    if sys.platform == "darwin":
+        return plistlib.dumps({"Label": LABEL, "ProgramArguments": list(args), "RunAtLoad": True, "KeepAlive": True,
+                               "StandardOutPath": logfile, "StandardErrorPath": logfile}).decode()
+    quoted = " ".join('"%s"' % x.replace('"', '\\"') for x in args)
+    return ("[Unit]\nDescription=Smart Context Compressor\n\n[Service]\nExecStart=%s\nRestart=always\nRestartSec=2\n"
+            "StandardError=append:%s\n\n[Install]\nWantedBy=default.target\n" % (quoted, logfile))
+
+
+def _service(action, args=None, logfile=None):
+    """Start or stop the background service. Returns (ok, note)."""
+    sh = lambda *c: subprocess.run(c, capture_output=True, text=True).returncode
+    path, mac = _service_file(), sys.platform == "darwin"
+    if not mac and not (sys.platform.startswith("linux") and shutil.which("systemctl")):
+        return False, "this system has no supported background service; keep `ctxc serve` running yourself"
+    if action == "start":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_service_text(args, logfile))
+        if mac:
+            domain = "gui/%d" % os.getuid()
+            sh("launchctl", "bootout", "%s/%s" % (domain, LABEL))
+            ok = sh("launchctl", "bootstrap", domain, str(path)) == 0 or sh("launchctl", "load", "-w", str(path)) == 0
+        else:
+            sh("systemctl", "--user", "daemon-reload")
+            ok = sh("systemctl", "--user", "enable", "ctxc.service") == 0 and \
+                sh("systemctl", "--user", "restart", "ctxc.service") == 0
+        return ok, str(path)
+    if mac:
+        if sh("launchctl", "bootout", "gui/%d/%s" % (os.getuid(), LABEL)) != 0 and path.exists():
+            sh("launchctl", "unload", str(path))
+    else:
+        sh("systemctl", "--user", "disable", "--now", "ctxc.service")
+    if path.exists():
+        path.unlink()
+    return True, str(path)
+
+
+def _claude_settings():
+    path = Path.home() / ".claude" / "settings.json"
+    text = path.read_text() if path.exists() else ""
+    return path, (json.loads(text) if text.strip() else {})
+
+
+def turn_on(a):
+    """Keep the proxy running in the background and point Claude Code at it for every session."""
+    directory = Path(a.dir or os.environ.get("CTXC_DIR") or Path.home() / ".ctxc")
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        path, data = _claude_settings()
+    except ValueError as e:
+        print("ctxc: %s is not valid JSON (%s); fix it first, nothing was changed" % (Path.home() / ".claude/settings.json", e))
+        return 1
+    if not isinstance(data, dict) or not isinstance(data.get("env", {}), dict):
+        print("ctxc: unexpected layout in %s; nothing was changed" % path)
+        return 1
+    base = "http://%s:%d" % (a.host, a.port)
+    state_file = directory / "on.json"
+    before = data.get("env", {}).get("ANTHROPIC_BASE_URL")
+    if before == base and state_file.exists():              # already on: keep what was saved the first time
+        before = json.loads(state_file.read_text()).get("before")
+    elif before == base:
+        before = None
+    if before and a.anthropic_upstream == "https://api.anthropic.com":
+        a.anthropic_upstream = before                       # the provider Claude Code was already using
+    args = [sys.executable or "python3", str(Path(__file__).resolve()), "--dir", str(directory), "serve",
+            "--port", str(a.port), "--host", a.host, "--window", str(a.window), "--summarizer", a.summarizer,
+            "--wait", str(a.wait), "--anthropic-upstream", a.anthropic_upstream, "--openai-upstream", a.openai_upstream]
+    note = "not installed (--no-service)"
+    if not a.no_service:
+        ok, note = _service("start", args, str(directory / "ctxc.log"))
+        if not ok:
+            print("ctxc: could not start the background service: %s" % note)
+    deadline = time.time() + 8
+    while not _is_ctxc(a.host, a.port) and time.time() < deadline:
+        time.sleep(0.3)
+    if not _is_ctxc(a.host, a.port):                        # never point the agent at a proxy that is not there
+        print("ctxc: the compressor is not answering on %s, so Claude Code was left untouched.\n"
+              "      See %s for the reason." % (base, directory / "ctxc.log"))
+        return 1
+    data.setdefault("env", {})["ANTHROPIC_BASE_URL"] = base
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    state_file.write_text(json.dumps({"before": before, "base": base}))
+    print("ctxc is on.\n  compressor : running in the background at %s (open it in a browser)\n"
+          "  service    : %s\n  Claude Code: %s now points at the compressor%s\n"
+          "Restart any open agent or harness (T3 Code, Conductor, a terminal session) to pick it up.\n"
+          "Turn it off again with:  ctxc off" % (base, note, path, " (upstream: %s)" % before if before else ""))
+    return 0
+
+
+def turn_off(a):
+    directory = Path(a.dir or os.environ.get("CTXC_DIR") or Path.home() / ".ctxc")
+    state_file = directory / "on.json"
+    state = json.loads(state_file.read_text()) if state_file.exists() else {}
+    base = state.get("base") or "http://%s:%d" % (a.host, a.port)
+    try:
+        path, data = _claude_settings()
+        env = data.get("env") if isinstance(data, dict) else None
+        if isinstance(env, dict) and env.get("ANTHROPIC_BASE_URL") == base:
+            if state.get("before"):
+                env["ANTHROPIC_BASE_URL"] = state["before"]
+            else:
+                del env["ANTHROPIC_BASE_URL"]
+                if not env:
+                    del data["env"]
+            path.write_text(json.dumps(data, indent=2) + "\n")
+            print("Claude Code: restored %s" % path)
+        else:
+            print("Claude Code: %s was not pointing at ctxc; left as it is" % path)
+    except ValueError:
+        print("ctxc: %s is not valid JSON; remove ANTHROPIC_BASE_URL from it by hand" % (Path.home() / ".claude/settings.json"))
+    if not a.no_service:
+        _service("stop")
+        print("Background service: stopped and removed")
+    if state_file.exists():
+        state_file.unlink()
+    print("ctxc is off. Restart any open agent or harness.")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="ctxc", description="Smart Context Compressor: a context-compressing proxy for very long agent sessions.")
     ap.add_argument("--dir", help="store directory (default ~/.ctxc or $CTXC_DIR)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name, text in (("serve", "run the proxy"), ("run", "run an agent through the proxy:  ctxc run claude")):
+    for name, text in (("serve", "run the proxy"), ("run", "run an agent through the proxy:  ctxc run claude"),
+                       ("on", "always on: background service + Claude Code pointed at it (for T3 Code and other harnesses)")):
         p = sub.add_parser(name, help=text)
         p.add_argument("--port", type=int, default=8787)
         p.add_argument("--host", default="127.0.0.1")
@@ -1333,6 +1466,12 @@ def main(argv=None):
         p.add_argument("--verbose", action="store_true", help="log every request, not only epochs")
         if name == "run":
             p.add_argument("command", nargs=argparse.REMAINDER, help="the agent and its arguments")
+        if name == "on":
+            p.add_argument("--no-service", action="store_true", help="do not install the background service")
+    p = sub.add_parser("off", help="undo `ctxc on`")
+    p.add_argument("--port", type=int, default=8787)
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--no-service", action="store_true")
     p = sub.add_parser("recall", help="print an archived original: r:HASH or s:NUMBER")
     p.add_argument("ref")
     p.add_argument("--grep")
@@ -1347,6 +1486,8 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.cmd == "run":
         return run(a)
+    if a.cmd in ("on", "off"):
+        return turn_on(a) if a.cmd == "on" else turn_off(a)
     if a.cmd == "serve":
         srv = serve(a)
         try:
