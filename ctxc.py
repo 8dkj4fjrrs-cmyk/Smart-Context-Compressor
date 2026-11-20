@@ -38,7 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 FANIN = 4                       # summaries merged into one when the summary zone is full
 INDEX_CAP = 300 * 1024          # bytes of each stored output that are full-text indexed
 SIGNAL = re.compile(
@@ -1411,7 +1411,8 @@ def turn_on(a):
     print("ctxc is on.\n  compressor : running in the background at %s (open it in a browser)\n"
           "  service    : %s\n  Claude Code: %s now points at the compressor%s\n"
           "Restart any open agent or harness (T3 Code, Conductor, a terminal session) to pick it up.\n"
-          "Turn it off again with:  ctxc off" % (base, note, path, " (upstream: %s)" % before if before else ""))
+          "Turn it off again with:  %s off" % (base, note, path, " (upstream: %s)" % before if before else "",
+                                                 "ctxc" if shutil.which("ctxc") else "python3 %s" % Path(__file__).resolve()))
     return 0
 
 

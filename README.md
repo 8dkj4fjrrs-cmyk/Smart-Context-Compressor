@@ -12,7 +12,7 @@
 
 ---
 
-> In a 6,000-tool-call benchmark session (13M tokens of history), every request stays under **71K tokens** with **~99%** of it in an unchanged, cacheable prefix. Check your own numbers with `curl http://127.0.0.1:8787/__ctxc/stats`.
+> In a real T3 Code + Claude Code session, requests the agent sent at **146K tokens** reached the model at **55K**. In a 6,000-tool-call benchmark session (13M tokens of history), every request stays under **71K tokens** with **~99%** of it in an unchanged, cacheable prefix. Check your own numbers with `curl http://127.0.0.1:8787/__ctxc/stats`.
 
 ---
 
@@ -67,7 +67,7 @@ The agent runs these in its normal shell tool. Every digest and note carries the
 | Client | Use |
 |---|---|
 | Claude Code in a terminal | `ctxc run claude` |
-| T3 Code, Conductor or another harness driving Claude Code | `ctxc on` |
+| T3 Code, Conductor or another harness driving Claude Code | `ctxc on` (confirmed with T3 Code on macOS) |
 | Codex CLI | Option 1: a model provider with `base_url = "http://127.0.0.1:8787/v1"` and `wire_api = "responses"` |
 | aider, opencode and other clients that read `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` | `ctxc run <agent>` |
 | ZCode, or any client talking to Z.ai, OpenRouter or a relay | Option 2: the `/-/` upstream prefix |
@@ -196,7 +196,9 @@ On the fact-retention check (`tests/quality.py`), the mechanical fallback note k
 
 Open `http://127.0.0.1:8787` in a browser while the proxy is running.
 
-![The built-in web page](docs/web-ui.png)
+![The built-in web page during a real session](docs/web-ui.png)
+
+*A real session: Claude Code (Opus 5.5) driven by T3 Code on macOS. Token counts on the page are estimates.*
 
 It is one read-only page: how much has been saved, the latest requests (what the agent sent and what the model received), the address to give your agent, and a search box over everything that was compressed away. There is nothing to configure, and it only answers on localhost.
 
