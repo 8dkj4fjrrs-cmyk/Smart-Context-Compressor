@@ -151,6 +151,88 @@ class SessionTest(unittest.TestCase):
         self.assertIn("pytest -q", note)
         self.assertIn("ERROR in module_", note)
 
+    def test_folded_text_and_images_stay_recoverable(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = ctxc.Store(tmp.name)
+        self.addCleanup(store.db.close)
+        comp = ctxc.Compressor(store, 100000)
+        wire = sim.Wire("anthropic")
+        spec = "SPEC-START " + "requirement line. " * 600 + "SPEC-END-MARKER"         # ~11K characters
+        wire.msgs.append({"role": "user", "content": [
+            {"type": "text", "text": spec},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD" * 2000}}]})
+        for ev in list(sim.events(60))[1:]:
+            wire.add(ev)
+        wire.msgs.append({"role": "assistant", "content": [{"type": "tool_use", "id": "shot", "name": "Screenshot", "input": {}}]})
+        wire.msgs.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "shot", "content": [
+            {"type": "text", "text": "screenshot taken\n" + "pixel row\n" * 400},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "WFla" * 2000}}]}]})
+        for ev in list(sim.events(200, seed=5))[1:]:
+            wire.add(ev)
+        body = wire.body()
+        comp.compress(wire.ad, body)
+        sim.check_valid("anthropic", body)
+        sent = json.dumps(body)
+        self.assertNotIn("SPEC-END-MARKER", sent)                       # folded out of the prompt...
+        hit = store.search("SPEC-END-MARKER")
+        self.assertIn("s:", hit)                                        # ...but the whole message is in the archive
+        self.assertIn("matching lines", store.recall(hit.split(" ")[0], grep="SPEC-END-MARKER"))
+        self.assertNotIn("QUJDQUJD", sent)
+        self.assertNotIn("WFlaWFla", sent)
+        blobs = [zlib_text for (zlib_text,) in store.db.execute("SELECT data FROM blobs")]
+        import zlib
+        saved = b"".join(zlib.decompress(b) for b in blobs).decode()
+        self.assertIn("QUJD" * 2000, saved)                             # the user's image
+        self.assertIn("WFla" * 2000, saved)                             # the image inside a tool result
+        self.assertEqual(store.search("QUJDQUJD")[:10], "No matches")   # image data is kept out of the search index
+
+    def test_cut_off_notes_are_rejected(self):
+        self.assertGreaterEqual(ctxc.Anthropic().side({"model": "m"}, "x", None)["max_tokens"], 4000)
+        with self.assertRaises(ValueError):
+            ctxc.Anthropic().side_text({"stop_reason": "max_tokens", "content": [{"type": "text", "text": "REQUIREMENTS - a"}]})
+        with self.assertRaises(ValueError):
+            ctxc.Chat().side_text({"choices": [{"finish_reason": "length", "message": {"content": "REQ"}}]})
+        with self.assertRaises(ValueError):
+            ctxc.Responses().side_text({"status": "incomplete", "output": []})
+        self.assertEqual(ctxc.Anthropic().side_text({"stop_reason": "end_turn", "content": [{"type": "text", "text": "ok"}]}), "ok")
+
+    def test_a_long_existing_session_waits_once_not_once_per_note(self):
+        import time
+
+        def slow(ad, body, prompt, ctx):
+            time.sleep(0.4)
+            return "NOTE"
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = None
+        for wait, summ in ((0, None), (3.0, slow), (0.2, slow)):
+            store = ctxc.Store(tmp.name + "/w%d" % (wait * 10))
+            self.addCleanup(store.db.close)
+            comp = ctxc.Compressor(store, 100000, summarizer=summ, wait=wait)
+            wire = sim.Wire("anthropic")
+            for ev in sim.events(700):                                  # ~1.5M tokens seen for the first time
+                wire.add(ev)
+            body = wire.body()
+            t0 = time.time()
+            comp.compress(wire.ad, body, {}, {"url": "x", "headers": {}})
+            took = time.time() - t0
+            notes = comp.stats["model_summaries"] + comp.stats["mechanical_summaries"]
+            self.assertGreater(notes, 20)
+            self.assertLessEqual(ctxc.tok(body), 100000)
+            sim.check_valid("anthropic", body)
+            if summ is None:
+                base = took                                             # time with no waiting at all
+                continue
+            # the whole request waits at most once (it used to wait once per note: 27 x wait)
+            self.assertLess(took - base, wait + 1.5, "%d notes: %.1fs over the no-wait time" % (notes, took - base))
+            if wait == 3.0:
+                self.assertGreaterEqual(comp.stats["model_summaries"], 8)    # the first eight were written in parallel
+            else:
+                # too slow for this deadline: mechanical, except pre-started notes that happened to be ready
+                self.assertLessEqual(comp.stats["model_summaries"], 8)
+                self.assertGreater(comp.stats["mechanical_summaries"], 15)
+
     def test_failing_summariser_falls_back(self):
         def boom(ad, body, prompt, ctx):
             raise RuntimeError("upstream said no")
@@ -361,6 +443,9 @@ class ProxyTest(unittest.TestCase):
         data = json.load(open(settings))
         self.assertEqual(data, {"model": "opus", "env": {"FOO": "1", "ANTHROPIC_BASE_URL": "http://127.0.0.1:%d" % self.port}})
         self.assertIn("upstream: https://relay.example.com/api", on.stdout)
+        # the service runs from a private copy, so deleting the download cannot break the agent
+        self.assertEqual(open(home + "/.ctxc/ctxc.py").read(), open(SCRIPT).read())
+        self.assertIn("python3 %s/.ctxc/ctxc.py off" % os.path.realpath(home), on.stdout.replace(home, os.path.realpath(home)))
         self.assertEqual(cli("off", "--no-service").returncode, 0)
         self.assertEqual(json.load(open(settings))["env"]["ANTHROPIC_BASE_URL"], "https://relay.example.com/api")
         # with no previous value and no file: created, then removed cleanly
@@ -387,6 +472,16 @@ class ProxyTest(unittest.TestCase):
             unit = ctxc._service_text(args, "/tmp/ctxc.log")
             self.assertIn('ExecStart="/usr/bin/python3" "/opt/my tools/ctxc.py" "serve" "--port" "8787"', unit)
             self.assertIn("Restart=always", unit)
+
+    def test_only_requests_addressed_to_localhost_are_served(self):
+        up = "127.0.0.1:%d" % self.up.server_address[1]
+        before = len(Upstream.seen)
+        for path in ("/-/http/%s/v1/messages" % up, "/v1/messages", "/__ctxc/stats"):
+            status, _, data = self.post(path, {"model": "m", "messages": []}, {"Host": "evil.example.com"})
+            self.assertEqual(status, 403, path)
+        self.assertEqual(len(Upstream.seen), before)                     # nothing was forwarded
+        self.assertEqual(self.post("/v1/messages", {"model": "m", "stream": True, "messages": [
+            {"role": "user", "content": "hi"}]}, {"Host": "localhost:%d" % self.port})[0], 200)
 
     def test_routing_gzip_and_fail_open(self):
         up = "127.0.0.1:%d" % self.up.server_address[1]

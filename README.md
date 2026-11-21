@@ -116,6 +116,7 @@ ctxc off       # puts everything back
 ```
 
 - `ctxc on` installs a small background service (launchd on macOS, systemd on Linux) and sets `ANTHROPIC_BASE_URL` in `~/.claude/settings.json`, so every Claude Code session goes through the compressor, whichever app started it.
+- The service runs from its own copy of the program in `~/.ctxc/`, so moving or deleting the download does not break anything. After updating, run `ctxc on` again.
 - Claude Code is only pointed at the compressor after it has been confirmed running. A provider address you already had there is kept as the upstream and restored by `ctxc off`.
 - Restart the harness afterwards. This currently covers harnesses driving **Claude Code**; other agents inside a harness still need their own base-URL setting.
 
@@ -180,11 +181,13 @@ On the fact-retention check (`tests/quality.py`), the mechanical fallback note k
 
 **Does it make extra API calls?** Yes, by default: one background call per fold (roughly every 20–40K tokens of new conversation) so the model can write the note, on your key. `--summarizer off` makes none and uses mechanical notes.
 
+**What if I turn it on in the middle of a long session?** The first request folds the whole backlog at once. Up to eight notes are written by the model in parallel within the one `--wait`; older history beyond that gets mechanical notes.
+
 **What if the proxy gets something wrong?** It fails open. If parsing or compression raises an error, the original request is forwarded unchanged and the error is logged.
 
-**Can a request stall?** If a note is not ready when it is needed, the request waits up to `--wait` seconds (default 45) and then uses a mechanical note. The web page and the log show when that happens. See [Notes: quality, speed and cost](#notes-quality-speed-and-cost).
+**Can a request stall?** If notes are not ready when they are needed, the request waits up to `--wait` seconds in total (default 45), however many notes it needs, and then uses mechanical notes for the rest. The web page and the log show when that happens. See [Notes: quality, speed and cost](#notes-quality-speed-and-cost).
 
-**Is anything lost?** Not from the archive. The model's view is lossy by design; the originals stay in `~/.ctxc/ctx.db`.
+**Is anything lost?** The model's view is lossy by design; the originals stay in `~/.ctxc/ctx.db`: tool output, the full text of every folded message, and images and documents that were removed. The one exception is the model's private reasoning blocks inside folded messages, which are not archived.
 
 **Does my client still compact on its own?** It may. The proxy then treats the compacted conversation as a new session. The archive stays searchable.
 
@@ -238,14 +241,14 @@ Run with `--verbose` to log one line per request with tokens before and after. L
 
 ### Storage
 
-Everything is in one SQLite file, `~/.ctxc/ctx.db`. Archived tool output is stored compressed but **unencrypted**.
+Everything is in one SQLite file, `~/.ctxc/ctx.db`. Archived tool output, message text and images are stored compressed but **unencrypted**.
 
 ### Limits
 
 - The client still holds and sends its full transcript; only what reaches the model shrinks. Late in a month-long session each request body is tens of MB over loopback.
 - Request bodies compressed with anything other than gzip are forwarded unchanged.
 - Responses API requests that use `previous_response_id` are forwarded unchanged.
-- The proxy has no authentication: keep it on `127.0.0.1`.
+- The proxy has no authentication: keep it on `127.0.0.1`. Bound there, it refuses any request not addressed to localhost.
 
 ## License
 

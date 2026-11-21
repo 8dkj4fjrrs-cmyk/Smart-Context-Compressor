@@ -38,7 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 FANIN = 4                       # summaries merged into one when the summary zone is full
 INDEX_CAP = 300 * 1024          # bytes of each stored output that are full-text indexed
 SIGNAL = re.compile(
@@ -272,7 +272,7 @@ class Anthropic:
             t, nb = b.get("type"), b
             if t == "tool_result":
                 text, img = flat(b.get("content") or "")
-                new = rfn(b.get("tool_use_id"), text, img)
+                new = rfn(b.get("tool_use_id"), text, img, b.get("content"))
                 if new is not None:
                     nb = dict(b, content=new)
             elif t == "tool_use" and afn and isinstance(b.get("input"), dict):
@@ -280,7 +280,7 @@ class Anthropic:
                 if new is not None:
                     nb = dict(b, input=new)
             elif t in ("image", "document") and cold:
-                nb = {"type": "text", "text": "[%s elided by ctxc]" % t}
+                nb = {"type": "text", "text": cold(b, t)}
             changed |= nb is not b
             out.append(nb)
         return dict(m, content=out) if changed else m
@@ -289,7 +289,7 @@ class Anthropic:
         return {"role": "user", "content": [{"type": "text", "text": t} for t in texts]}
 
     def side(self, body, prompt, model):
-        out = {"model": model or body.get("model"), "max_tokens": 1500,
+        out = {"model": model or body.get("model"), "max_tokens": 4096,
                "messages": [{"role": "user", "content": prompt}]}
         for k in ("system", "metadata"):
             if body.get(k):
@@ -297,6 +297,8 @@ class Anthropic:
         return out
 
     def side_text(self, j):
+        if j.get("stop_reason") == "max_tokens":
+            raise ValueError("the note was cut off before it finished")
         return "".join(b.get("text", "") for b in j.get("content", []) if b.get("type") == "text")
 
 
@@ -340,7 +342,7 @@ class Chat:
     def trim(self, m, rfn, afn, cold):
         if m.get("role") == "tool":
             text, img = flat(m.get("content") or "")
-            new = rfn(m.get("tool_call_id"), text, img)
+            new = rfn(m.get("tool_call_id"), text, img, m.get("content"))
             return m if new is None else dict(m, content=new)
         out = m
         if afn and m.get("tool_calls"):
@@ -356,7 +358,7 @@ class Chat:
                 out = dict(out, tool_calls=calls)
         if cold and isinstance(m.get("content"), list) and any(p.get("type") != "text" for p in m["content"]):
             out = dict(out, content=[p if p.get("type") == "text" else
-                                     {"type": "text", "text": "[%s elided by ctxc]" % p.get("type")}
+                                     {"type": "text", "text": cold(p, p.get("type"))}
                                      for p in m["content"]])
         return out
 
@@ -369,7 +371,10 @@ class Chat:
                 "messages": msgs[:self.head(msgs)] + [{"role": "user", "content": prompt}]}
 
     def side_text(self, j):
-        return ((j.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        choice = (j.get("choices") or [{}])[0]
+        if choice.get("finish_reason") == "length":
+            raise ValueError("the note was cut off before it finished")
+        return (choice.get("message") or {}).get("content") or ""
 
 
 class Responses:
@@ -424,7 +429,7 @@ class Responses:
         t = m.get("type", "message")
         if t.endswith("_output"):
             text, img = flat(m.get("output") or "")
-            new = rfn(m.get("call_id"), text, img)
+            new = rfn(m.get("call_id"), text, img, m.get("output"))
             return m if new is None else dict(m, output=new)
         if afn and t == "function_call":
             args = _loads(m.get("arguments"))
@@ -437,7 +442,7 @@ class Responses:
                 "text" not in str(p.get("type")) for p in m["content"]):
             kind = "output_text" if m.get("role") == "assistant" else "input_text"
             return dict(m, content=[p if "text" in str(p.get("type")) else
-                                    {"type": kind, "text": "[%s elided by ctxc]" % p.get("type")} for p in m["content"]])
+                                    {"type": kind, "text": cold(p, p.get("type"))} for p in m["content"]])
         return m
 
     def summary(self, texts):
@@ -451,6 +456,8 @@ class Responses:
         return out
 
     def side_text(self, j):
+        if j.get("status") == "incomplete":
+            raise ValueError("the note was cut off before it finished")
         return "".join(p.get("text", "") for it in j.get("output", []) if it.get("type") == "message"
                        for p in it.get("content", []) if isinstance(p, dict))
 
@@ -498,7 +505,7 @@ class Store:
         sql = self.db.execute("SELECT sql FROM sqlite_master WHERE name='fts'").fetchone()
         self.has_fts = bool(sql and "fts5" in (sql[0] or "").lower())
 
-    def put(self, text):
+    def put(self, text, index=True):
         """Archive a tool output (content-addressed, so repeats cost nothing). Returns its ref."""
         ref = hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:10]
         if ref in self.known:
@@ -508,7 +515,7 @@ class Store:
                 raw = text.encode("utf-8", "replace")
                 self.db.execute("INSERT INTO blobs VALUES(?,?,?,?,?)",
                                 (ref, time.time(), len(_lines(text)), len(raw), zlib.compress(raw, 6)))
-                idx = _lines(text[:INDEX_CAP])
+                idx = _lines(text[:INDEX_CAP]) if index else []
                 self.db.executemany("INSERT INTO fts(content, ref) VALUES(?,?)", [
                     ("\n".join(idx[i:i + 40]), "r:%s:%d" % (ref, i + 1)) for i in range(0, len(idx), 40)])
                 self.db.commit()
@@ -634,13 +641,14 @@ class Store:
 
 # ------------------------------------------------------------------ compressor
 
-def transcript(ad, msgs):
-    """Plain-text rendering of a message range (summariser input, search index, recall)."""
+def transcript(ad, msgs, user_clip=None, asst_clip=None):
+    """Plain-text rendering of a message range. Unclipped for the archive; clipped for the summariser."""
     out = []
     for m in msgs:
         for p in ad.parts(m):
             if p[0] == "text" and p[2].strip():
-                out.append("%s: %s" % ("USER" if p[1] == "user" else "ASSISTANT", p[2].strip()[:4000]))
+                out.append("%s: %s" % ("USER" if p[1] == "user" else "ASSISTANT",
+                                       p[2].strip()[:user_clip if p[1] == "user" else asst_clip]))
             elif p[0] == "call":
                 out.append("CALL %s %s" % (p[2], one_line(json.dumps(p[3], ensure_ascii=False), 300)))
             elif p[0] == "result":
@@ -714,6 +722,18 @@ class Compressor:
             self.memo[key] = make()
         return self.memo[key]
 
+    def _elide(self, block, kind):
+        """Archive an image or document that is leaving the prompt, and return the text that replaces it."""
+        return "[%s elided by ctxc · saved as r:%s]" % (kind, self.store.put(json.dumps(block, sort_keys=True), index=False))
+
+    def _attach(self, raw):
+        """Archive the non-text parts (images) of a tool result whose text is being replaced."""
+        parts = [p for p in raw if isinstance(p, dict) and not isinstance(p.get("text"), str)] if isinstance(raw, list) else []
+        if not parts:
+            return ""
+        return "\n[ctxc: %d attachment(s) saved as r:%s]" % (
+            len(parts), self.store.put(json.dumps(parts, sort_keys=True), index=False))
+
     # -- per-message rewriting: pure functions of the raw messages and the zone edges
     def _cold(self, ad, msgs, a, b, w, rich=False):
         """Cold zone: digest tool output, drop results of calls repeated later, shorten big call arguments."""
@@ -727,15 +747,15 @@ class Compressor:
         if rich:                                # what the summariser reads: 4x more of each tool output
             keep, dig = keep * 4, dig * 4
 
-        def rfn(cid, text, img):
-            t = toks(text)
+        def rfn(cid, text, img, raw=None):
+            t, extra = toks(text), self._attach(raw) if img else ""
             if t > 60 and cid in key_of and last[key_of[cid]] != cid:
                 return self._memo("dup", text, 0, lambda: "[ctxc: output dropped, the same call was repeated "
-                                  "later · r:%s]" % self.store.put(text))
+                                  "later · r:%s]" % self.store.put(text)) + extra
             if t <= keep and not img:
                 return None
             return self._memo("cold", text, dig, lambda: "%s\n[ctxc r:%s · %d lines · `%s recall r:%s --grep REGEX`]" % (
-                digest(text, dig), self.store.put(text), len(_lines(text)), self.cli, self.store.put(text)))
+                digest(text, dig), self.store.put(text), len(_lines(text)), self.cli, self.store.put(text))) + extra
 
         def afn(args):
             out = None
@@ -744,17 +764,18 @@ class Compressor:
                     out = out or dict(args)
                     out[k] = "%s …[ctxc: +%d chars elided · r:%s]" % (v[:300], len(v) - 300, self.store.put(v))
             return out
-        return [ad.trim(m, rfn, afn, True) for m in msgs[a:b]]
+        return [ad.trim(m, rfn, afn, self._elide) for m in msgs[a:b]]
 
     def _hot(self, ad, msgs, a, cap):
         """Hot zone: verbatim, except single tool outputs too large for the window."""
-        def rfn(cid, text, img):
+        def rfn(cid, text, img, raw=None):
             if toks(text) <= cap:
                 return None
             return self._memo("hot", text, cap, lambda: (
                 "%s\n[ctxc r:%s · %d lines, too large for the window · `%s recall r:%s --lines A:B` or `--grep REGEX`]"
-                % (digest(text, cap // 2), self.store.put(text), len(_lines(text)), self.cli, self.store.put(text))))
-        return [ad.trim(m, rfn, None, False) for m in msgs[a:]]
+                % (digest(text, cap // 2), self.store.put(text), len(_lines(text)), self.cli, self.store.put(text)))
+            ) + (self._attach(raw) if img else "")
+        return [ad.trim(m, rfn, None, None) for m in msgs[a:]]
 
     def _view(self, ad, msgs, st, head, w):
         texts = [INTRO.format(cli=self.cli)] + ["[s:%d · messages %d–%d]\n%s" % (s["id"], s["a"], s["b"], s["text"])
@@ -787,8 +808,9 @@ class Compressor:
             if total > over + 0.70 * w:
                 epoch = True
                 st["k"] = 1.0
+                ep = {}                         # all waiting in this request shares one deadline
                 for _ in range(4):
-                    self._epoch(ad, body, msgs, st, over, w, sid, ctx)
+                    self._epoch(ad, body, msgs, st, over, w, sid, ctx, ep)
                     view = self._view(ad, msgs, st, head, w)
                     total = over + tok(view[head:])
                     if total <= self.window * 0.92:
@@ -830,7 +852,7 @@ class Compressor:
             acc += tok(msgs[i])
         return None
 
-    def _epoch(self, ad, body, msgs, st, over, w, sid, ctx):
+    def _epoch(self, ad, body, msgs, st, over, w, sid, ctx, ep):
         n, f = len(msgs), st["f"]
         bounds = ad.boundaries(msgs, f)
         hot = self._hot(ad, msgs, f, int(w * 0.14 * st["k"]))
@@ -847,11 +869,26 @@ class Compressor:
         # 2. fold the oldest cold messages into notes until the view is back to ~42% of the room
         cold_t = [tok(m) for m in self._cold(ad, msgs, f, c, w)]
         total = over + sum(toks(s["text"]) for s in st["sums"]) + sum(cold_t) + sum(tok(m) for m in hot[c - f:])
+        ep.setdefault("deadline", time.time() + self.wait)     # the clock starts now, after the local work above
+        if self.summarizer and not ep.get("planned"):
+            # Several ranges may need notes at once (a long session met for the first time): ask for them
+            # together, so the request waits once, not once per note. At most 8; older backlog beyond that
+            # gets mechanical notes.
+            ep["planned"] = True
+            pf, ptotal, pcold = f, total, cold_t
+            for _ in range(8):
+                if not (ptotal > over + 0.42 * w and pf < c):
+                    break
+                end = self._chunk_end(ad, msgs, pf, w, bounds)
+                end = c if end is None or end > c else end
+                self._start((sid, pf, end), ad, body, ctx, lambda: self._fold_prompt(ad, msgs, st, pf, end, w))
+                ptotal += w // 60 - sum(pcold[:end - pf])
+                pcold, pf = pcold[end - pf:], end
         while total > over + 0.42 * w and f < c:
             end = self._chunk_end(ad, msgs, f, w, bounds)
             end = c if end is None or end > c else end
             rng = self._cold(ad, msgs, f, end, w)
-            text = self._note((sid, f, end), ad, body, ctx, lambda: self._fold_prompt(ad, msgs, st, f, end, w))
+            text = self._note((sid, f, end), ad, body, ctx, lambda: self._fold_prompt(ad, msgs, st, f, end, w), ep)
             self.stats["model_summaries" if text else "mechanical_summaries"] += 1
             text = clip(text, w // 40) if text else mechanical(ad, rng, max(300, w // 60))
             fid = self.store.add_fold(sid, f, end, text, transcript(ad, rng))
@@ -863,7 +900,7 @@ class Compressor:
         while sum(toks(s["text"]) for s in st["sums"]) > 0.16 * w and len(st["sums"]) >= 2:
             old = st["sums"][:FANIN]
             ids = [s["id"] for s in old]
-            text = self._note((sid, "merge", tuple(ids)), ad, body, ctx, lambda: self._merge_prompt(old, w))
+            text = self._note((sid, "merge", tuple(ids)), ad, body, ctx, lambda: self._merge_prompt(old, w), ep)
             if not text:
                 each = max(60, int(0.04 * w) // len(old))
                 text = "\n".join("(messages %d–%d) %s" % (s["a"], s["b"], clip(s["text"], each)) for s in old)
@@ -875,11 +912,11 @@ class Compressor:
 
     def _fold_prompt(self, ad, msgs, st, f, end, w):
         notes = "\n\n".join(s["text"] for s in st["sums"])
-        after = transcript(ad, self._cold(ad, msgs, end, min(len(msgs), end + 40), w))
+        after = transcript(ad, self._cold(ad, msgs, end, min(len(msgs), end + 40), w), 4000, 2000)
         return SUMMARISE.format(
             words=max(200, w // 75),
             notes=clip(notes, int(0.16 * w)) or "(none: this slice is the start of the session)",
-            body=clip(transcript(ad, self._cold(ad, msgs, f, end, w, rich=True)), int(0.45 * self.window)),
+            body=clip(transcript(ad, self._cold(ad, msgs, f, end, w, rich=True), 12000, 4000), int(0.45 * self.window)),
             after=clip(after, int(0.06 * w)) or "(nothing yet)")
 
     def _merge_prompt(self, old, w):
@@ -912,18 +949,21 @@ class Compressor:
                 self.pending.discard(key)
         threading.Thread(target=work, daemon=True).start()
 
-    def _note(self, key, ad, body, ctx, prompt):
-        """Model-written note for a range: normally prepared in advance; otherwise ask now and wait a
-        bounded time. Returns None if there is no summariser or it did not answer in time."""
-        self._start(key, ad, body, ctx, prompt)
-        deadline = time.time() + self.wait
-        while key in self.pending and time.time() < deadline:
+    def _note(self, key, ad, body, ctx, prompt, ep):
+        """Model-written note for a range: normally prepared in advance; otherwise ask now and wait until the
+        request's shared deadline. Returns None if there is no summariser or it did not answer in time."""
+        if time.time() < ep["deadline"]:
+            self._start(key, ad, body, ctx, prompt)
+        while key in self.pending and time.time() < ep["deadline"]:
             time.sleep(0.02)
-        if key in self.pending:                 # still being written: do not hold the agent up any longer
+        text = self.prepared.pop(key, None)
+        if text is None and self.summarizer and key not in self.failed:     # not ready: do not hold the agent up
             self.stats["notes_timed_out"] += 1
-            log("a note was not ready after %ds, so a mechanical note was used. To avoid this, give notes more "
-                "time (--wait 90) or a faster model (--summarizer MODEL)" % self.wait)
-        return self.prepared.pop(key, None)
+            if not ep.get("logged"):
+                ep["logged"] = True
+                log("a note was not ready after %gs, so a mechanical note was used. To avoid this, give notes "
+                    "more time (--wait 90) or a faster model (--summarizer MODEL)" % self.wait)
+        return text
 
     def _prepare(self, ad, body, msgs, st, sid, w, ctx):
         """Ahead of the next epoch, have the model write the next note in the background, so the
@@ -1145,9 +1185,6 @@ class Proxy(BaseHTTPRequestHandler):
         """The built-in web page and its read-only JSON endpoints."""
         u = urlsplit(self.path)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
-        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
-        if self.cfg["host"] in ("127.0.0.1", "localhost", "::1") and host not in ("127.0.0.1", "localhost", "::1"):
-            return self._reply(403, {"error": "the ctxc page only answers on localhost"})   # blocks DNS rebinding
         store = comp.store
         if u.path == "/":
             data = PAGE.encode()
@@ -1170,6 +1207,15 @@ class Proxy(BaseHTTPRequestHandler):
     def _handle(self):
         self.close_connection = True
         comp = self.cfg["compressor"]
+        # A proxy bound to localhost only answers requests addressed to localhost. This stops a web page
+        # from reaching it under another name (DNS rebinding) and using it to fetch from the local network.
+        local = ("127.0.0.1", "localhost", "::1")
+        host = (self.headers.get("Host") or "").strip()
+        host = host[1:].split("]")[0] if host.startswith("[") else host.rsplit(":", 1)[0]
+        if self.cfg["host"] in local and host not in local:
+            self._body()
+            return self._reply(403, {"type": "error", "error": {
+                "type": "ctxc_forbidden_host", "message": "ctxc only answers requests addressed to localhost"}})
         if self.path.startswith("/__ctxc/") or (self.command == "GET" and self.path.split("?")[0] == "/"):
             return self._page(comp)
         body, url = self._body(), self._route()
@@ -1400,7 +1446,10 @@ def turn_on(a):
         before = None
     if before and a.anthropic_upstream == "https://api.anthropic.com":
         a.anthropic_upstream = before                       # the provider Claude Code was already using
-    args = [sys.executable or "python3", str(Path(__file__).resolve()), "--dir", str(directory), "serve",
+    program = directory / "ctxc.py"                         # the service must not depend on the download folder
+    if Path(__file__).resolve() != program.resolve():
+        shutil.copyfile(str(Path(__file__).resolve()), str(program))
+    args = [sys.executable or "python3", str(program), "--dir", str(directory), "serve",
             "--port", str(a.port), "--host", a.host, "--window", str(a.window), "--summarizer", a.summarizer,
             "--wait", str(a.wait), "--anthropic-upstream", a.anthropic_upstream, "--openai-upstream", a.openai_upstream]
     note = "not installed (--no-service)"
@@ -1420,10 +1469,11 @@ def turn_on(a):
     path.write_text(json.dumps(data, indent=2) + "\n")
     state_file.write_text(json.dumps({"before": before, "base": base}))
     print("ctxc is on.\n  compressor : running in the background at %s (open it in a browser)\n"
-          "  service    : %s\n  Claude Code: %s now points at the compressor%s\n"
+          "  service    : %s\n  program    : %s (a copy; run `on` again after updating)\n"
+          "  Claude Code: %s now points at the compressor%s\n"
           "Restart any open agent or harness (T3 Code, Conductor, a terminal session) to pick it up.\n"
-          "Turn it off again with:  %s off" % (base, note, path, " (upstream: %s)" % before if before else "",
-                                                 "ctxc" if shutil.which("ctxc") else "python3 %s" % Path(__file__).resolve()))
+          "Turn it off again with:  %s off" % (base, note, program, path, " (upstream: %s)" % before if before else "",
+                                                 "ctxc" if shutil.which("ctxc") else "python3 %s" % program))
     return 0
 
 
@@ -1472,7 +1522,7 @@ def main(argv=None):
                             "a model name = that model instead (pick a faster, cheaper one); "
                             "off = mechanical notes only, no extra API calls")
         p.add_argument("--wait", type=float, default=45.0,
-                       help="max seconds a request may wait for a model-written note before a mechanical one is used")
+                       help="max seconds one request may wait for model-written notes before mechanical ones are used")
         p.add_argument("--anthropic-upstream", default=os.environ.get("CTXC_ANTHROPIC_UPSTREAM", "https://api.anthropic.com"))
         p.add_argument("--openai-upstream", default=os.environ.get("CTXC_OPENAI_UPSTREAM", "https://api.openai.com"))
         p.add_argument("--cli", help="command name shown to the model for recall/search (default: found automatically)")
