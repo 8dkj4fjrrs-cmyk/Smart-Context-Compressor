@@ -6,7 +6,7 @@
 
 **One Python file · no dependencies · no injected tools · responses streamed back untouched**
 
-![license](https://img.shields.io/badge/license-MIT-blue) ![python](https://img.shields.io/badge/python-3.9%2B-blue) ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![status](https://img.shields.io/badge/status-prototype-orange)
+[![tests](https://github.com/8dkj4fjrrs-cmyk/Smart-Context-Compressor/actions/workflows/tests.yml/badge.svg)](https://github.com/8dkj4fjrrs-cmyk/Smart-Context-Compressor/actions/workflows/tests.yml) ![license](https://img.shields.io/badge/license-MIT-blue) ![python](https://img.shields.io/badge/python-3.9%2B-blue) ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen) ![status](https://img.shields.io/badge/status-prototype-orange)
 
 `ctxc run claude` · one command starts the compressor and your agent together · open `http://127.0.0.1:8787` in a browser to watch it work
 
@@ -91,7 +91,7 @@ cd Smart-Context-Compressor
 python3 ctxc.py run claude
 ```
 
-Needs Python 3.9 or newer (developed on 3.13) with SQLite, which ships with Python. There are no dependencies.
+Needs Python 3.9 or newer with SQLite, which ships with Python. There are no dependencies. The test suite runs on Python 3.9 to 3.13.
 
 ## Quickstart
 
@@ -156,7 +156,7 @@ curl http://127.0.0.1:8787/__ctxc/stats
 > There is no build step. `ctxc.py` is the whole program.
 
 ```sh
-python3 tests/test_ctxc.py     # test suite, including an end-to-end proxy test against a mock API
+python3 tests/test_ctxc.py     # test suite, including end-to-end proxy tests against a mock API
 python3 tests/sim.py 6000      # replay a 6,000-tool-call session and print the table below
 python3 tests/quality.py       # plant 14 facts in a noisy slice and count which survive folding
 ```
@@ -191,7 +191,9 @@ On the fact-retention check (`tests/quality.py`), the mechanical fallback note k
 
 **Does my client still compact on its own?** It may. The proxy then treats the compacted conversation as a new session. The archive stays searchable.
 
-**How are tokens counted?** Estimated as characters ÷ 3.5, which is deliberately conservative.
+**How are tokens counted?** Estimated as characters ÷ 3.5 when deciding what to compress. The real counts reported by the API are shown next to the estimates on the web page and are used to correct the estimate when it runs low.
+
+**What about token-counting requests?** When an agent asks the API how many tokens a conversation has, it is counted as the model would receive it, and nothing else happens: no folding, no notes, no statistics.
 
 ## Running the proxy
 
@@ -205,6 +207,8 @@ Open `http://127.0.0.1:8787` in a browser while the proxy is running.
 
 It is one read-only page: how much has been saved, the latest requests (what the agent sent and what the model received), the address to give your agent, and a search box over everything that was compressed away. There is nothing to configure, and it only answers on localhost.
 
+Two kinds of numbers appear on it. "Agent sent" and "Model received" are the compressor's own estimates. "API counted" and "Read from cache" are the real figures, read from the usage data in the model's replies as they pass through unchanged; the page also says how far the estimates are off. If the API counts more than estimated, the compressor folds sooner to stay inside the window.
+
 ### Flags
 
 ```sh
@@ -213,7 +217,8 @@ ctxc serve        # `ctxc run AGENT` takes the same flags
   --host 127.0.0.1            # listen address
   --window 100000             # most tokens the model should ever see
   --summarizer auto           # auto | off | a model name to write notes with
-  --wait 45                   # max seconds a request waits for a note
+  --wait 45                   # max seconds a request waits for notes
+  --retention-days 0          # remove archived originals unused for N days (0 = keep everything)
   --anthropic-upstream URL    # default https://api.anthropic.com
   --openai-upstream URL       # default https://api.openai.com
   --verbose                   # log every request, not only folds
@@ -239,9 +244,16 @@ To change this while using `ctxc on`, run it again with the new options, for exa
 
 Run with `--verbose` to log one line per request with tokens before and after. Lines marked `(epoch)` are the requests where folding happened.
 
-### Storage
+### Storage and clean-up
 
-Everything is in one SQLite file, `~/.ctxc/ctx.db`. Archived tool output, message text and images are stored compressed but **unencrypted**.
+Everything is in one SQLite file, `~/.ctxc/ctx.db`. By default nothing is ever removed, so the file keeps growing; its size is shown on the web page and by `ctxc stats`.
+
+```sh
+ctxc gc --days 30                 # remove originals and notes not used for 30 days, and shrink the file
+ctxc serve --retention-days 30    # or do the same automatically (also works with run and on)
+```
+
+An original that is still being referenced counts as used and is kept. The log file is trimmed automatically. Archived tool output, message text and images are stored compressed but **unencrypted**.
 
 ### Limits
 

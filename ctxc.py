@@ -38,7 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 FANIN = 4                       # summaries merged into one when the summary zone is full
 INDEX_CAP = 300 * 1024          # bytes of each stored output that are full-text indexed
 SIGNAL = re.compile(
@@ -481,7 +481,7 @@ class Store:
     def __init__(self, directory=None, readonly=False):
         self.dir = Path(directory or os.environ.get("CTXC_DIR") or Path.home() / ".ctxc")
         self.lock = threading.RLock()
-        self.known = set()
+        self.known, self.known_since = set(), time.time()
         path = self.dir / "ctx.db"
         if readonly:
             self.db = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=10, check_same_thread=False)
@@ -508,10 +508,15 @@ class Store:
     def put(self, text, index=True):
         """Archive a tool output (content-addressed, so repeats cost nothing). Returns its ref."""
         ref = hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:10]
+        if time.time() - self.known_since > 600:        # `known` is only a short-lived cache: another process
+            self.known, self.known_since = set(), time.time()       # (ctxc gc) may have removed entries
         if ref in self.known:
             return ref
         with self.lock:
-            if not self.db.execute("SELECT 1 FROM blobs WHERE ref=?", (ref,)).fetchone():
+            if self.db.execute("SELECT 1 FROM blobs WHERE ref=?", (ref,)).fetchone():
+                self.db.execute("UPDATE blobs SET ts=? WHERE ref=?", (time.time(), ref))    # still in use: keep it
+                self.db.commit()
+            else:
                 raw = text.encode("utf-8", "replace")
                 self.db.execute("INSERT INTO blobs VALUES(?,?,?,?,?)",
                                 (ref, time.time(), len(_lines(text)), len(raw), zlib.compress(raw, 6)))
@@ -562,12 +567,12 @@ class Store:
         if kind == "r":
             r = self.db.execute("SELECT * FROM blobs WHERE ref=?", (key,)).fetchone()
             if not r:
-                return "No stored output %s." % ref
+                return "No stored output %s (it may have been removed by clean-up)." % ref
             title, text = "r:%s (%d lines)" % (key, r["n_lines"]), zlib.decompress(r["data"]).decode("utf-8", "replace")
         elif kind == "s" and key.isdigit():
             r = self.db.execute("SELECT * FROM folds WHERE id=?", (int(key),)).fetchone()
             if not r:
-                return "No summary %s." % ref
+                return "No summary %s (it may have been removed by clean-up)." % ref
             kids = json.loads(r["kids"] or "[]")
             title = "s:%s (messages %d–%d%s)" % (key, r["a"], r["b"],
                                                 "; merges " + ", ".join("s:%d" % k for k in kids) if kids else "")
@@ -632,10 +637,36 @@ class Store:
             return "No matches for %r." % query
         return "\n".join(out + ["Fetch with: recall REF --lines A:B  (or --grep REGEX)"])
 
+    def disk_mb(self):
+        try:
+            return os.path.getsize(self.dir / "ctx.db") / 1e6
+        except OSError:
+            return 0.0
+
+    def gc(self, days, vacuum=False):
+        """Remove archived originals and notes last used more than `days` days ago. Returns (outputs, notes)."""
+        cutoff = time.time() - days * 86400
+        with self.lock:
+            nb = self.db.execute("SELECT COUNT(*) FROM blobs WHERE ts<?", (cutoff,)).fetchone()[0]
+            nf = self.db.execute("SELECT COUNT(*) FROM folds WHERE ts<?", (cutoff,)).fetchone()[0]
+            if nb or nf:
+                self.db.execute("DELETE FROM fts WHERE rowid IN (SELECT rowid FROM fts WHERE ref LIKE 'r:%' AND "
+                                "substr(ref,3,10) IN (SELECT ref FROM blobs WHERE ts<?))", (cutoff,))
+                self.db.execute("DELETE FROM fts WHERE rowid IN (SELECT rowid FROM fts WHERE ref LIKE 's:%' AND "
+                                "CAST(substr(ref,3) AS INTEGER) IN (SELECT id FROM folds WHERE ts<?))", (cutoff,))
+                self.db.execute("DELETE FROM blobs WHERE ts<?", (cutoff,))
+                self.db.execute("DELETE FROM folds WHERE ts<?", (cutoff,))
+            self.db.execute("DELETE FROM sessions WHERE updated<?", (cutoff,))
+            self.db.commit()
+            self.known = set()
+            if vacuum:
+                self.db.execute("VACUUM")       # hand the freed space back to the disk
+        return nb, nf
+
     def stats(self):
         q = lambda sql: self.db.execute(sql).fetchone()[0]
-        return ("store: %s\nsessions: %d   summaries: %d   archived tool outputs: %d (%.1f MB raw)" % (
-            self.dir, q("SELECT COUNT(*) FROM sessions"), q("SELECT COUNT(*) FROM folds"),
+        return ("store: %s (%.1f MB on disk)\nsessions: %d   summaries: %d   archived tool outputs: %d (%.1f MB raw)" % (
+            self.dir, self.disk_mb(), q("SELECT COUNT(*) FROM sessions"), q("SELECT COUNT(*) FROM folds"),
             q("SELECT COUNT(*) FROM blobs"), q("SELECT COALESCE(SUM(n_bytes),0) FROM blobs") / 1e6))
 
 
@@ -712,7 +743,27 @@ class Compressor:
         self.started = time.time()
         self.locks, self.guard = {}, threading.Lock()
         self.stats = {"requests": 0, "raw_tokens": 0, "sent_tokens": 0, "epochs": 0,
-                      "model_summaries": 0, "mechanical_summaries": 0, "notes_timed_out": 0}
+                      "model_summaries": 0, "mechanical_summaries": 0, "notes_timed_out": 0,
+                      "api_requests": 0, "api_input_tokens": 0, "api_cached_tokens": 0, "api_estimated_tokens": 0}
+        self.calib = {}                     # session -> (tokens the API counted) / (tokens estimated)
+
+    def observe(self, info, usage, entry=None):
+        """Record what the API itself counted for a request that was compressed (input tokens, cached part)."""
+        counted, cached = usage
+        est = info.get("est") or 0
+        if not counted or not est:
+            return
+        self.stats["api_requests"] += 1
+        self.stats["api_input_tokens"] += counted
+        self.stats["api_cached_tokens"] += cached
+        self.stats["api_estimated_tokens"] += est
+        if entry is not None:
+            entry["counted"], entry["cached"] = counted, cached
+        ratio = min(2.0, max(0.5, counted / est))
+        if len(self.calib) > 2000:
+            self.calib.clear()
+        old = self.calib.get(info.get("sid"))
+        self.calib[info.get("sid")] = ratio if old is None else 0.7 * old + 0.3 * ratio
 
     def _memo(self, kind, text, budget, make):
         key = (kind, hash(text), len(text), budget)
@@ -786,8 +837,9 @@ class Compressor:
         return msgs[:head] + summary + cold + hot
 
     # -- the main entry point
-    def compress(self, ad, body, headers=None, ctx=None):
-        """Rewrite body in place. Returns (raw_tokens, sent_tokens, epoch_happened)."""
+    def compress(self, ad, body, headers=None, ctx=None, dry=False):
+        """Rewrite body in place. Returns (raw_tokens, sent_tokens, epoch_happened).
+        dry=True gives the same view without folding, starting notes, or touching state and statistics."""
         msgs = ad.msgs(body)
         if msgs is None:
             return 0, 0, False
@@ -805,25 +857,33 @@ class Compressor:
             view = self._view(ad, msgs, st, head, w)
             total = over + tok(view[head:])
             epoch = False
-            if total > over + 0.70 * w:
+            # If the API has been counting more tokens than estimated for this session, fold that much sooner.
+            scale = max(1.0, self.calib.get(sid, 1.0))
+            if dry:
+                pass
+            elif total * scale > over + 0.70 * w:
                 epoch = True
                 st["k"] = 1.0
-                ep = {}                         # all waiting in this request shares one deadline
+                ep = {"scale": scale}           # all waiting in this request shares one deadline
                 for _ in range(4):
                     self._epoch(ad, body, msgs, st, over, w, sid, ctx, ep)
                     view = self._view(ad, msgs, st, head, w)
                     total = over + tok(view[head:])
-                    if total <= self.window * 0.92:
+                    if total * scale <= self.window * 0.92:
                         break
                     st["k"] /= 2                # one enormous recent result: tighten the hot zone
                 self.store.save(sid, st)
                 self.stats["epochs"] += 1
-            elif total > over + 0.50 * w:
+            elif total * scale > over + 0.50 * w:
                 self._prepare(ad, body, msgs, st, sid, w, ctx)
             ad.put(body, view)
             if ad.name == "anthropic" and st["sums"]:
                 self._cache_mark(body, view[head])
             raw = over + sum(tok(m) for m in msgs[st["f"]:]) + int(st.get("raw_folded", 0))
+            if dry:
+                return raw, total, False
+            if ctx is not None:
+                ctx["sid"], ctx["est"] = sid, total
             self.stats["requests"] += 1
             self.stats["raw_tokens"] += raw
             self.stats["sent_tokens"] += total
@@ -877,14 +937,14 @@ class Compressor:
             ep["planned"] = True
             pf, ptotal, pcold = f, total, cold_t
             for _ in range(8):
-                if not (ptotal > over + 0.42 * w and pf < c):
+                if not (ptotal * ep.get("scale", 1.0) > over + 0.42 * w and pf < c):
                     break
                 end = self._chunk_end(ad, msgs, pf, w, bounds)
                 end = c if end is None or end > c else end
                 self._start((sid, pf, end), ad, body, ctx, lambda: self._fold_prompt(ad, msgs, st, pf, end, w))
                 ptotal += w // 60 - sum(pcold[:end - pf])
                 pcold, pf = pcold[end - pf:], end
-        while total > over + 0.42 * w and f < c:
+        while total * ep.get("scale", 1.0) > over + 0.42 * w and f < c:
             end = self._chunk_end(ad, msgs, f, w, bounds)
             end = c if end is None or end > c else end
             rng = self._cold(ad, msgs, f, end, w)
@@ -1009,12 +1069,12 @@ PAGE = r"""<!doctype html>
 :root{--bg:#F6F8FA;--card:#FFFFFF;--line:#E2E8F0;--text:#0F172A;--muted:#5B6676;--accent:#0E7C86;--soft:#E6F6F7;--ok:#16A34A}
 @media (prefers-color-scheme:dark){:root{--bg:#0B1220;--card:#121C2E;--line:#243349;--text:#E6EBF3;--muted:#9AA7B8;--accent:#44C7D1;--soft:#12313A;--ok:#4ADE80}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,"Segoe UI",Helvetica,Arial,sans-serif}
-main{max-width:980px;margin:0 auto;padding:28px 20px 60px}
+main{max-width:1080px;margin:0 auto;padding:28px 20px 60px}
 h1{font-size:22px;margin:0}h2{font-size:15px;margin:0 0 12px;font-weight:700}
 .top{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:22px}
 .state{color:var(--muted);font-size:14px}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--ok);margin-right:6px}
 .dot.off{background:#DC2626}
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-bottom:14px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px;margin-bottom:14px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin-bottom:14px}
 .tile{margin:0}.num{font-size:28px;font-weight:700;letter-spacing:-.5px}.lab{color:var(--muted);font-size:13px}
 .sub{color:var(--muted);font-size:13px;margin-top:2px}
@@ -1040,6 +1100,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
   <div class="card tile"><div class="lab">Tokens saved</div><div class="num" id="saved">–</div><div class="bar"><i id="bar" style="width:0"></i></div></div>
   <div class="card tile"><div class="lab">Sent to the model</div><div class="num" id="sent">–</div><div class="sub" id="raw"></div></div>
   <div class="card tile"><div class="lab">Notes written</div><div class="num" id="notes">–</div><div class="sub" id="notesub"></div></div>
+  <div class="card tile"><div class="lab">Read from cache</div><div class="num" id="cache">–</div><div class="sub" id="cachesub">as counted by the API</div></div>
 </div>
 
 <div class="card"><h2>Connect an agent</h2>
@@ -1070,17 +1131,21 @@ function ago(t){const s=Date.now()/1000-t;return s<60?Math.max(1,Math.round(s))+
 async function tick(){
   try{
     const d=await (await fetch("/__ctxc/stats")).json();
-    $("dot").className="dot";$("state").textContent="running · window "+n(d.window)+" tokens · notes: "+(d.summaries==="off"?"mechanical":d.summaries==="auto"?"written by the model":"written by "+d.summaries)+" · v"+d.version;
+    $("dot").className="dot";$("state").textContent="running · window "+n(d.window)+" tokens · notes: "+(d.summaries==="off"?"mechanical":d.summaries==="auto"?"written by the model":"written by "+d.summaries)+" · archive "+d.archive_mb+" MB · v"+d.version;
     $("req").textContent=n(d.requests);$("up").textContent="up "+(d.uptime<3600?Math.round(d.uptime/60)+" min":(d.uptime/3600).toFixed(1)+" h");
     const pct=d.raw_tokens?100*(1-d.sent_tokens/d.raw_tokens):0;
     $("saved").textContent=d.raw_tokens?pct.toFixed(1)+"%":"–";$("bar").style.width=pct+"%";
     $("sent").textContent=short(d.sent_tokens);$("raw").textContent=d.raw_tokens?"instead of "+short(d.raw_tokens):"";
     $("notes").textContent=n(d.model_summaries+d.mechanical_summaries);
     $("notesub").textContent=d.model_summaries+" by the model · "+d.mechanical_summaries+" mechanical"+(d.notes_timed_out?" ("+d.notes_timed_out+" timed out)":"");
+    if(d.api_requests){$("cache").textContent=(100*d.api_cached_tokens/d.api_input_tokens).toFixed(1)+"%";
+      const off=100*(d.api_estimated_tokens/d.api_input_tokens-1);
+      $("cachesub").textContent="API counted "+short(d.api_input_tokens)+" input tokens · estimates run "+Math.abs(off).toFixed(0)+"% "+(off>=0?"high":"low")}
     if(d.recent.length){
-      const t=el("table"),h=el("tr");[["When"],["API"],["Model"],["Agent sent","r"],["Model received","r"],[""]].forEach(c=>h.appendChild(el("th",c[0],c[1])));t.appendChild(h);
+      const t=el("table"),h=el("tr");[["When"],["API"],["Model"],["Agent sent","r"],["Model received","r"],["API counted","r"],["From cache","r"],[""]].forEach(c=>h.appendChild(el("th",c[0],c[1])));t.appendChild(h);
       d.recent.slice(0,12).forEach(r=>{const tr=el("tr");tr.appendChild(el("td",ago(r.t)));tr.appendChild(el("td",r.api));tr.appendChild(el("td",r.model));
-        tr.appendChild(el("td",n(r.raw),"r"));tr.appendChild(el("td",n(r.sent),"r"));const c=el("td");if(r.folded)c.appendChild(el("span","folded","tag"));tr.appendChild(c);t.appendChild(tr)});
+        tr.appendChild(el("td",n(r.raw),"r"));tr.appendChild(el("td",n(r.sent),"r"));
+        tr.appendChild(el("td",r.counted?n(r.counted):"–","r"));tr.appendChild(el("td",r.counted?Math.round(100*r.cached/r.counted)+"%":"–","r"));const c=el("td");if(r.folded)c.appendChild(el("span","folded","tag"));tr.appendChild(c);t.appendChild(tr)});
       $("recent").replaceChildren(t)}
   }catch(e){$("dot").className="dot off";$("state").textContent="not reachable"}
 }
@@ -1100,6 +1165,63 @@ tick();setInterval(tick,3000);
 # ----------------------------------------------------------------------- proxy
 
 LOG_FILE = None      # `ctxc run` logs here so the agent's own screen stays clean
+
+
+class UsageTap:
+    """Reads the token counts out of a model reply as it streams past. It only looks: the bytes sent on to
+    the agent are never changed. Returns (input tokens including cached, cached tokens) or None."""
+
+    def __init__(self, content_type, encoding):
+        enc = (encoding or "").lower()
+        self.ok = enc in ("", "identity", "gzip")
+        self.z = zlib.decompressobj(31) if enc == "gzip" else None
+        self.sse = "event-stream" in (content_type or "")
+        self.buf, self.counted, self.cached = b"", 0, 0
+
+    def feed(self, data):
+        if not self.ok:
+            return
+        try:
+            self.buf += self.z.decompress(data) if self.z else data
+            if self.sse:
+                lines = self.buf.split(b"\n")
+                self.buf = lines.pop()
+                for line in lines:
+                    if line.startswith(b"data:") and b'"usage"' in line:
+                        self._take(line[5:])
+            elif len(self.buf) > 4000000:
+                self.ok, self.buf = False, b""
+        except Exception:
+            self.ok = False
+
+    def done(self):
+        try:
+            if self.ok and not self.sse and self.buf:
+                self._take(self.buf)
+        except Exception:
+            pass
+        return (self.counted, self.cached) if self.counted else None
+
+    def _take(self, raw):
+        try:
+            o = json.loads(raw)
+        except ValueError:
+            return
+        if not isinstance(o, dict):
+            return
+        for u in (o.get("usage"), (o.get("message") or {}).get("usage"), (o.get("response") or {}).get("usage")):
+            if not isinstance(u, dict):
+                continue
+            if "prompt_tokens" in u:                                    # OpenAI Chat Completions
+                counted = u.get("prompt_tokens") or 0
+                cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+            elif "cache_read_input_tokens" in u or "cache_creation_input_tokens" in u:     # Anthropic
+                cached = u.get("cache_read_input_tokens") or 0
+                counted = (u.get("input_tokens") or 0) + (u.get("cache_creation_input_tokens") or 0) + cached
+            else:                                                       # OpenAI Responses, or Anthropic without caching
+                counted = u.get("input_tokens") or 0
+                cached = (u.get("input_tokens_details") or {}).get("cached_tokens") or 0
+            self.counted, self.cached = max(self.counted, counted), max(self.cached, cached)
 
 
 def log(msg):
@@ -1202,6 +1324,7 @@ class Proxy(BaseHTTPRequestHandler):
                                                               q.get("lines") or None, 8000)})
             return self._reply(200, dict(comp.stats, version=VERSION, window=comp.window, store=str(store.dir),
                                          uptime=int(time.time() - comp.started), recent=list(comp.recent),
+                                         archive_mb=round(store.disk_mb(), 1), retention=self.cfg.get("retention", 0),
                                          summaries=self.cfg["summarizer"]))
 
     def _handle(self):
@@ -1221,6 +1344,7 @@ class Proxy(BaseHTTPRequestHandler):
         body, url = self._body(), self._route()
         headers = {k: v for k, v in self.headers.items()}
         ad = adapter_for(url) if self.command == "POST" and body else None
+        info = entry = None                     # set when this request was compressed and its reply should be read
         if ad:
             # Fail open: whatever goes wrong in here, the original request is forwarded unchanged.
             try:
@@ -1228,12 +1352,17 @@ class Proxy(BaseHTTPRequestHandler):
                 if enc in ("", "identity", "gzip"):
                     parsed = json.loads(gzip.decompress(body) if enc == "gzip" else body)
                     ctx = {"url": url.replace("/count_tokens", ""), "headers": dict(headers)}
-                    raw, sent, epoch = comp.compress(ad, parsed, {k.lower(): v for k, v in headers.items()}, ctx)
+                    counting = url.split("?")[0].rstrip("/").endswith("/count_tokens")     # a question, not a turn
+                    raw, sent, epoch = comp.compress(ad, parsed, {k.lower(): v for k, v in headers.items()}, ctx,
+                                                     dry=counting)
                     if raw:
                         body = json.dumps(parsed, ensure_ascii=False, separators=(",", ":")).encode()
                         headers = {k: v for k, v in headers.items() if k.lower() != "content-encoding"}
-                        comp.recent.appendleft({"t": time.time(), "api": ad.name, "model": str(parsed.get("model", "?")),
-                                                "raw": raw, "sent": sent, "folded": epoch})
+                    if raw and not counting:
+                        info = ctx
+                        entry = {"t": time.time(), "api": ad.name, "model": str(parsed.get("model", "?")),
+                                 "raw": raw, "sent": sent, "folded": epoch}
+                        comp.recent.appendleft(entry)
                         if epoch or self.cfg["verbose"]:
                             log("%s %s: %d → %d tokens%s" % (ad.name, parsed.get("model", "?"), raw, sent,
                                                               "  (epoch)" if epoch else ""))
@@ -1258,14 +1387,21 @@ class Proxy(BaseHTTPRequestHandler):
             elif chunked:
                 self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
+            tap = UsageTap(resp.getheader("Content-Type"), resp.getheader("Content-Encoding")) \
+                if info and resp.status == 200 else None
             while True:                         # bytes go back exactly as they arrive
                 data = resp.read1(65536)
                 if not data:
                     break
                 self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data) if chunked else data)
                 self.wfile.flush()
+                if tap:
+                    tap.feed(data)
             if chunked:
                 self.wfile.write(b"0\r\n\r\n")
+            usage = tap.done() if tap else None
+            if usage:
+                comp.observe(info, usage, entry)
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
@@ -1292,6 +1428,23 @@ def make_summarizer(model):
     return run
 
 
+def _maintain(store, days):
+    """Background housekeeping: optional archive retention, and keeping the log file small."""
+    while True:
+        try:
+            if days > 0:
+                nb, nf = store.gc(days)
+                if nb or nf:
+                    log("clean-up: removed %d archived outputs and %d notes not used for %d days" % (nb, nf, days))
+            path = Path(LOG_FILE) if LOG_FILE else store.dir / "ctxc.log"
+            if path.exists() and path.stat().st_size > 5000000:         # keep the last ~500 KB
+                tail = path.read_bytes()[-500000:]
+                path.write_bytes(tail[tail.find(b"\n") + 1:])
+        except Exception as e:
+            log("housekeeping skipped (%s: %s)" % (type(e).__name__, e))
+        time.sleep(6 * 3600)
+
+
 def serve(a):
     store = Store(a.dir)
     if not a.cli:           # what the model is told to type for recall: `ctxc` if installed, else the full path
@@ -1300,9 +1453,11 @@ def serve(a):
                       None if a.summarizer == "off" else make_summarizer(None if a.summarizer == "auto" else a.summarizer),
                       a.wait)
     Proxy.cfg = {"compressor": comp, "anthropic": a.anthropic_upstream, "openai": a.openai_upstream,
-                 "verbose": a.verbose, "host": a.host, "summarizer": a.summarizer}
+                 "verbose": a.verbose, "host": a.host, "summarizer": a.summarizer,
+                 "retention": getattr(a, "retention_days", 0)}
     srv = ThreadingHTTPServer((a.host, a.port), Proxy)
     srv.daemon_threads = True
+    threading.Thread(target=_maintain, args=(store, getattr(a, "retention_days", 0)), daemon=True).start()
     log("ctxc %s on http://%s:%d  window=%d  store=%s  summaries=%s" % (
         VERSION, a.host, srv.server_address[1], a.window, store.dir, a.summarizer))
     log("open http://%s:%d in a browser to see what it is doing" % (a.host, srv.server_address[1]))
@@ -1451,7 +1606,8 @@ def turn_on(a):
         shutil.copyfile(str(Path(__file__).resolve()), str(program))
     args = [sys.executable or "python3", str(program), "--dir", str(directory), "serve",
             "--port", str(a.port), "--host", a.host, "--window", str(a.window), "--summarizer", a.summarizer,
-            "--wait", str(a.wait), "--anthropic-upstream", a.anthropic_upstream, "--openai-upstream", a.openai_upstream]
+            "--wait", str(a.wait), "--anthropic-upstream", a.anthropic_upstream, "--openai-upstream", a.openai_upstream,
+            "--retention-days", str(a.retention_days)]
     note = "not installed (--no-service)"
     if not a.no_service:
         ok, note = _service("start", args, str(directory / "ctxc.log"))
@@ -1525,6 +1681,8 @@ def main(argv=None):
                        help="max seconds one request may wait for model-written notes before mechanical ones are used")
         p.add_argument("--anthropic-upstream", default=os.environ.get("CTXC_ANTHROPIC_UPSTREAM", "https://api.anthropic.com"))
         p.add_argument("--openai-upstream", default=os.environ.get("CTXC_OPENAI_UPSTREAM", "https://api.openai.com"))
+        p.add_argument("--retention-days", type=int, default=0,
+                       help="remove archived originals not used for this many days (default 0 = keep everything)")
         p.add_argument("--cli", help="command name shown to the model for recall/search (default: found automatically)")
         p.add_argument("--verbose", action="store_true", help="log every request, not only epochs")
         if name == "run":
@@ -1544,6 +1702,8 @@ def main(argv=None):
     p.add_argument("query", nargs="+")
     p.add_argument("--limit", type=int, default=8)
     sub.add_parser("stats")
+    p = sub.add_parser("gc", help="remove archived originals not used for N days and shrink the database")
+    p.add_argument("--days", type=int, required=True)
     p = sub.add_parser("link", help="install a `ctxc` launcher into ~/.local/bin")
     p.add_argument("--bin", default=str(Path.home() / ".local" / "bin"))
     a = ap.parse_args(argv)
@@ -1564,6 +1724,17 @@ def main(argv=None):
         target.write_text('#!/bin/sh\nexec "%s" "%s" "$@"\n' % (sys.executable or "python3", Path(__file__).resolve()))
         target.chmod(0o755)
         print("Installed %s (make sure %s is on PATH)" % (target, target.parent))
+        return 0
+    if a.cmd == "gc":
+        store = Store(a.dir)
+        before = store.disk_mb()
+        try:
+            nb, nf = store.gc(a.days, vacuum=True)
+        except sqlite3.OperationalError as e:       # the running proxy holds the file: entries are gone, space comes later
+            print("ctxc: removed old entries, but could not shrink the file right now (%s); run it again later" % e)
+            return 1
+        print("Removed %d archived outputs and %d notes not used for %d days. Database: %.1f MB → %.1f MB" % (
+            nb, nf, a.days, before, store.disk_mb()))
         return 0
     try:
         store = Store(a.dir, readonly=True)

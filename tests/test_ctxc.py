@@ -233,6 +233,98 @@ class SessionTest(unittest.TestCase):
                 self.assertLessEqual(comp.stats["model_summaries"], 8)
                 self.assertGreater(comp.stats["mechanical_summaries"], 15)
 
+    def test_dry_run_and_calibration(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = ctxc.Store(tmp.name)
+        self.addCleanup(store.db.close)
+        calls = []
+        comp = ctxc.Compressor(store, 100000, summarizer=lambda *a: calls.append(1) or "NOTE", wait=1)
+        wire = sim.Wire("anthropic")
+        for ev in sim.events(400):
+            wire.add(ev)
+        body = wire.body()
+        raw, sent, epoch = comp.compress(wire.ad, body, dry=True)        # far over the window, but only a question
+        self.assertFalse(epoch)
+        self.assertGreater(raw, 100000)
+        self.assertEqual((calls, comp.stats["requests"], comp.stats["epochs"]), ([], 0, 0))
+        self.assertEqual(store.db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 0)
+        # calibration: when the API counts more than estimated, the same conversation is folded sooner
+        wire = sim.Wire("chat")
+        for ev in sim.events(50):
+            wire.add(ev)
+        ctx = {}
+        _, est, epoch = comp.compress(wire.ad, wire.body(), {}, ctx)
+        self.assertFalse(epoch)
+        self.assertTrue(0.3 * 100000 < est < 0.7 * 100000, est)
+        entry = {}
+        comp.observe(ctx, (int(est * 1.9), int(est * 1.5)), entry)
+        self.assertEqual(entry["counted"], int(est * 1.9))
+        self.assertTrue(comp.compress(wire.ad, wire.body(), {}, {})[2])
+        comp.observe({"sid": "x", "est": 0}, (5, 0))                     # nothing to compare against: ignored
+        self.assertEqual(comp.stats["api_requests"], 1)
+
+    def test_usage_tap(self):
+        import zlib
+        sse = (b'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":12,'
+               b'"cache_creation_input_tokens":300,"cache_read_input_tokens":4000,"output_tokens":1}}}\n\n'
+               b'event: content_block_delta\ndata: {"delta":{"text":"the word \\"usage\\" in prose"}}\n\n'
+               b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":55}}\n\n')
+        for step in (1, 7, len(sse)):                                    # however the bytes are split up
+            tap = ctxc.UsageTap("text/event-stream; charset=utf-8", None)
+            for i in range(0, len(sse), step):
+                tap.feed(sse[i:i + step])
+            self.assertEqual(tap.done(), (4312, 4000))
+        gz = zlib.compressobj(wbits=31)
+        packed = gz.compress(sse) + gz.flush()
+        tap = ctxc.UsageTap("text/event-stream", "gzip")
+        for i in range(0, len(packed), 5):
+            tap.feed(packed[i:i + 5])
+        self.assertEqual(tap.done(), (4312, 4000))
+        tap = ctxc.UsageTap("application/json", "")                      # OpenAI Chat Completions, not streamed
+        tap.feed(b'{"choices":[],"usage":{"prompt_tokens":900,"prompt_tokens_details":{"cached_tokens":600}}}')
+        self.assertEqual(tap.done(), (900, 600))
+        tap = ctxc.UsageTap("text/event-stream", None)                   # OpenAI Responses
+        tap.feed(b'data: {"type":"response.completed","response":{"usage":{"input_tokens":700,'
+                 b'"input_tokens_details":{"cached_tokens":650}}}}\n\n')
+        self.assertEqual(tap.done(), (700, 650))
+        for ctype, enc, data in (("text/event-stream", "br", sse), ("application/json", None, b"not json"),
+                                 ("text/event-stream", "gzip", b"not gzip at all")):
+            tap = ctxc.UsageTap(ctype, enc)
+            tap.feed(data)
+            self.assertIsNone(tap.done())                                # unreadable: ignored, never an error
+
+    def test_archive_clean_up(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = ctxc.Store(tmp.name)
+        self.addCleanup(store.db.close)
+        old = store.put("old output with the word zebrafish\n" * 50)
+        kept = store.put("still used output with the word wombat\n" * 50)
+        new = store.put("new output with the word narwhal\n" * 50)
+        fold_old = store.add_fold("s1", 0, 5, "old note", "USER: please remember quokka")
+        fold_new = store.add_fold("s1", 5, 9, "new note", "USER: please remember axolotl")
+        store.save("gone", {"f": 0})
+        long_ago = __import__("time").time() - 40 * 86400
+        store.db.execute("UPDATE blobs SET ts=? WHERE ref IN (?,?)", (long_ago, old, kept))
+        store.db.execute("UPDATE folds SET ts=? WHERE id=?", (long_ago, fold_old))
+        store.db.execute("UPDATE sessions SET updated=?", (long_ago,))
+        store.db.commit()
+        store.known = set()
+        self.assertEqual(store.put("still used output with the word wombat\n" * 50), kept)     # seen again today
+        self.assertEqual(store.gc(30), (1, 1))
+        self.assertIn("removed by clean-up", store.recall("r:" + old))
+        self.assertIn("removed by clean-up", store.recall("s:%d" % fold_old))
+        for word, found in (("zebrafish", False), ("quokka", False), ("wombat", True), ("narwhal", True), ("axolotl", True)):
+            self.assertEqual("No matches" not in store.search(word), found, word)
+        self.assertIsNone(store.load("gone"))
+        self.assertEqual(store.put("old output with the word zebrafish\n" * 50), old)           # can be stored again
+        self.assertIn("zebrafish", store.recall("r:" + old))
+        out = subprocess.run([sys.executable, SCRIPT, "--dir", tmp.name, "gc", "--days", "30"],
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("Removed 0 archived outputs", out.stdout)
+
     def test_failing_summariser_falls_back(self):
         def boom(ad, body, prompt, ctx):
             raise RuntimeError("upstream said no")
@@ -264,7 +356,8 @@ class SessionTest(unittest.TestCase):
         self.assertNotIn("Step 290", json.dumps(body))                   # nothing from the abandoned branch
 
 
-SSE = [b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+SSE = [b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,"
+       b"\"cache_creation_input_tokens\":200,\"cache_read_input_tokens\":800}}}\n\n",
        b"event: content_block_delta\ndata: {\"delta\":{\"text\":\"hel\"}}\n\n",
        b"event: content_block_delta\ndata: {\"delta\":{\"text\":\"lo\"}}\n\n",
        b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"]
@@ -386,6 +479,12 @@ class ProxyTest(unittest.TestCase):
                 self.post("/v1/messages", wire.body(), {"x-api-key": "sk-test"})
         stats = json.loads(self.get("/__ctxc/stats")[2])
         self.assertEqual(stats["recent"][0]["api"], "anthropic")
+        # what the API itself counted is read from its replies (which were relayed unchanged)
+        self.assertEqual(stats["api_requests"], stats["requests"])
+        self.assertEqual(stats["api_input_tokens"], 1010 * stats["requests"])
+        self.assertEqual(stats["api_cached_tokens"], 800 * stats["requests"])
+        self.assertEqual((stats["recent"][0]["counted"], stats["recent"][0]["cached"]), (1010, 800))
+        self.assertGreaterEqual(stats["archive_mb"], 0)
         self.assertGreater(stats["recent"][0]["raw"], stats["recent"][0]["sent"])
         self.assertNotIn("sk-test", json.dumps(stats))                        # credentials never surface
         lines = json.loads(self.get("/__ctxc/search?q=pytest")[2])["lines"]
@@ -482,6 +581,25 @@ class ProxyTest(unittest.TestCase):
         self.assertEqual(len(Upstream.seen), before)                     # nothing was forwarded
         self.assertEqual(self.post("/v1/messages", {"model": "m", "stream": True, "messages": [
             {"role": "user", "content": "hi"}]}, {"Host": "localhost:%d" % self.port})[0], 200)
+
+    def test_token_counting_requests_change_nothing(self):
+        wire = sim.Wire("anthropic")
+        for ev in sim.events(60):
+            wire.add(ev)
+        self.post("/v1/messages", wire.body(), {"x-api-key": "k"})
+        before = json.loads(self.get("/__ctxc/stats")[2])
+        for ev in list(sim.events(40, seed=3))[1:]:
+            wire.add(ev)
+        body = dict(wire.body(), stream=False)
+        status, _, _ = self.post("/v1/messages/count_tokens?beta=true", body, {"x-api-key": "k"})
+        self.assertEqual(status, 200)
+        path, _, seen = Upstream.seen[-1]
+        self.assertEqual(path, "/v1/messages/count_tokens?beta=true")
+        self.assertLess(ctxc.tok(seen), ctxc.tok(body))                  # it is counted as the model would see it
+        after = json.loads(self.get("/__ctxc/stats")[2])
+        for key in ("requests", "epochs", "model_summaries", "mechanical_summaries", "sent_tokens"):
+            self.assertEqual(after[key], before[key], key)
+        self.assertEqual(len(after["recent"]), len(before["recent"]))
 
     def test_routing_gzip_and_fail_open(self):
         up = "127.0.0.1:%d" % self.up.server_address[1]
