@@ -38,7 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 FANIN = 4                       # summaries merged into one when the summary zone is full
 INDEX_CAP = 300 * 1024          # bytes of each stored output that are full-text indexed
 SIGNAL = re.compile(
@@ -1681,8 +1681,8 @@ def main(argv=None):
                        help="max seconds one request may wait for model-written notes before mechanical ones are used")
         p.add_argument("--anthropic-upstream", default=os.environ.get("CTXC_ANTHROPIC_UPSTREAM", "https://api.anthropic.com"))
         p.add_argument("--openai-upstream", default=os.environ.get("CTXC_OPENAI_UPSTREAM", "https://api.openai.com"))
-        p.add_argument("--retention-days", type=int, default=0,
-                       help="remove archived originals not used for this many days (default 0 = keep everything)")
+        p.add_argument("--retention-days", type=int, default=30,
+                       help="remove archived originals not used for this many days (default 30; 0 = keep everything)")
         p.add_argument("--cli", help="command name shown to the model for recall/search (default: found automatically)")
         p.add_argument("--verbose", action="store_true", help="log every request, not only epochs")
         if name == "run":

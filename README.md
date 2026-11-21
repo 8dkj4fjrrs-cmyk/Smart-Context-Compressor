@@ -2,7 +2,7 @@
 
 **Run a coding agent for weeks in one session, inside a 100K-token window.**
 
-*A small local proxy that compresses the conversation on its way to the model, and keeps every original.*
+*A small local proxy that compresses the conversation on its way to the model, and keeps the originals within reach.*
 
 **One Python file · no dependencies · no injected tools · responses streamed back untouched**
 
@@ -27,7 +27,7 @@ Smart Context Compressor shrinks each request before it reaches the model:
 - **Recent work is left exactly as it is**, so the model sees what it is doing now.
 - **Old tool output is trimmed**: long logs, test runs and file dumps are cut to their beginning, their error lines and their end.
 - **The oldest part of the conversation is replaced by notes**: what you asked for, what was decided and why, what changed in each file, exact values worth keeping, and what is still unfinished.
-- **Nothing is deleted**: everything removed is saved to a local database, and the agent can look up the original whenever it needs the exact detail.
+- **The originals are kept**: everything removed is saved to a local database, and the agent can look up the original whenever it needs the exact detail. Originals not used for 30 days are cleaned up; that period is yours to change, or to switch off.
 
 The model never spends a turn deciding what to compress, and **prompt caching keeps working** because the compressed conversation only changes when it has to.
 
@@ -59,7 +59,7 @@ The agent runs these in its normal shell tool. Every digest and note carries the
 
 - **`ctxc recall r:1a2b3c4d5e`** — the original of a digested tool output. Add `--grep REGEX` or `--lines A:B` to pull only the part needed.
 - **`ctxc recall s:12`** — the transcript behind a note, with the same `--grep` and `--lines` options.
-- **`ctxc search WORDS`** — full-text search over everything ever removed.
+- **`ctxc search WORDS`** — full-text search over everything in the archive.
 - **`ctxc stats`** — size of the archive.
 
 ## Which do I need?
@@ -187,7 +187,7 @@ On the fact-retention check (`tests/quality.py`), the mechanical fallback note k
 
 **Can a request stall?** If notes are not ready when they are needed, the request waits up to `--wait` seconds in total (default 45), however many notes it needs, and then uses mechanical notes for the rest. The web page and the log show when that happens. See [Notes: quality, speed and cost](#notes-quality-speed-and-cost).
 
-**Is anything lost?** The model's view is lossy by design; the originals stay in `~/.ctxc/ctx.db`: tool output, the full text of every folded message, and images and documents that were removed. The one exception is the model's private reasoning blocks inside folded messages, which are not archived.
+**Is anything lost?** The model's view is lossy by design; the originals go to `~/.ctxc/ctx.db`: tool output, the full text of every folded message, and images and documents that were removed. Originals not used for 30 days are removed by default (`--retention-days 0` keeps them forever). The model's private reasoning blocks inside folded messages are not archived.
 
 **Does my client still compact on its own?** It may. The proxy then treats the compacted conversation as a new session. The archive stays searchable.
 
@@ -218,7 +218,7 @@ ctxc serve        # `ctxc run AGENT` takes the same flags
   --window 100000             # most tokens the model should ever see
   --summarizer auto           # auto | off | a model name to write notes with
   --wait 45                   # max seconds a request waits for notes
-  --retention-days 0          # remove archived originals unused for N days (0 = keep everything)
+  --retention-days 30         # remove archived originals unused for N days (0 = keep everything)
   --anthropic-upstream URL    # default https://api.anthropic.com
   --openai-upstream URL       # default https://api.openai.com
   --verbose                   # log every request, not only folds
@@ -246,11 +246,14 @@ Run with `--verbose` to log one line per request with tokens before and after. L
 
 ### Storage and clean-up
 
-Everything is in one SQLite file, `~/.ctxc/ctx.db`. By default nothing is ever removed, so the file keeps growing; its size is shown on the web page and by `ctxc stats`.
+Everything is in one SQLite file, `~/.ctxc/ctx.db`. Its size is shown on the web page and by `ctxc stats`.
+
+By default, originals and notes that have not been used for 30 days are removed automatically, so the file stops growing in long-running use.
 
 ```sh
-ctxc gc --days 30                 # remove originals and notes not used for 30 days, and shrink the file
-ctxc serve --retention-days 30    # or do the same automatically (also works with run and on)
+ctxc serve --retention-days 90    # keep them longer (also works with run and on)
+ctxc serve --retention-days 0     # keep everything forever
+ctxc gc --days 30                 # clean up by hand, and hand the freed space back to the disk
 ```
 
 An original that is still being referenced counts as used and is kept. The log file is trimmed automatically. Archived tool output, message text and images are stored compressed but **unencrypted**.
